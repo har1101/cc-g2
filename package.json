@@ -1,0 +1,30 @@
+{
+  "name": "cc-g2",
+  "packageManager": "pnpm@10.30.3",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0 --port 5173",
+    "hub:dev": "node server/notification-hub/index.mjs",
+    "hub:watch": "node --watch server/notification-hub/index.mjs",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "vitest run test/even-events.test.ts test/format-and-wav.test.ts test/hub-approval-api.test.mjs test/hub-hook-endpoint.test.mjs",
+    "test:all": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@evenrealities/even_hub_sdk": "^0.0.7"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "vite": "^7.3.1",
+    "vitest": "^4.0.18"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}

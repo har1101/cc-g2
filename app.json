@@ -1,0 +1,11 @@
+{
+  "package_id": "ai.wmoto.cc-g2",
+  "edition": "202602",
+  "name": "cc-g2",
+  "version": "0.1.0",
+  "min_app_version": "0.1.0",
+  "tagline": "Even G2 voice-to-agent PoC",
+  "description": "Voice input and result display proof of concept for Even G2 smart glasses",
+  "author": "wmoto-ai",
+  "entrypoint": "index.html"
+}

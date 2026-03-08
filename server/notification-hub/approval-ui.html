@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Approval Dashboard</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a2e; color: #e0e0e0; padding: 16px; }
+  h1 { font-size: 1.3rem; margin-bottom: 12px; color: #a0c4ff; }
+  .status { font-size: 0.85rem; color: #888; margin-bottom: 16px; }
+  .empty { color: #666; font-style: italic; padding: 24px 0; text-align: center; }
+  .card { background: #16213e; border: 1px solid #0f3460; border-radius: 8px; padding: 14px; margin-bottom: 12px; }
+  .card.decided { opacity: 0.5; }
+  .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+  .tool-name { font-weight: 700; color: #e94560; font-size: 1rem; }
+  .badge { font-size: 0.75rem; padding: 2px 8px; border-radius: 10px; font-weight: 600; }
+  .badge-pending { background: #533a00; color: #ffc107; }
+  .badge-approve { background: #0a3d0a; color: #4caf50; }
+  .badge-deny { background: #3d0a0a; color: #f44336; }
+  .detail { font-size: 0.85rem; color: #aaa; white-space: pre-wrap; word-break: break-all; max-height: 200px; overflow-y: auto; margin-bottom: 10px; background: #0d1b36; padding: 8px; border-radius: 4px; }
+  .meta { font-size: 0.75rem; color: #666; margin-bottom: 8px; }
+  .actions { display: flex; gap: 8px; }
+  .btn { border: none; padding: 8px 20px; border-radius: 6px; font-size: 0.9rem; font-weight: 600; cursor: pointer; transition: opacity 0.2s; }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-approve { background: #4caf50; color: #fff; }
+  .btn-approve:hover:not(:disabled) { background: #66bb6a; }
+  .btn-deny { background: #f44336; color: #fff; }
+  .btn-deny:hover:not(:disabled) { background: #ef5350; }
+</style>
+</head>
+<body>
+<h1>Approval Dashboard</h1>
+<div class="status" id="status">接続中...</div>
+<div id="list"></div>
+<script>
+const API = location.origin;
+let allApprovals = [];
+let decidedCache = {};
+
+function authHeaders(extra) {
+  return extra ? Object.assign({}, extra) : {};
+}
+
+async function fetchApprovals() {
+  try {
+    const [pendingRes, healthRes] = await Promise.all([
+      fetch(API + '/api/approvals', { headers: authHeaders() }),
+      fetch(API + '/api/health'),
+    ]);
+    const pending = await pendingRes.json();
+    const health = await healthRes.json();
+    document.getElementById('status').textContent =
+      'Hub: OK | pending: ' + health.pendingApprovals + ' | ' + new Date().toLocaleTimeString('ja-JP');
+    var pendingItems = (pending.items || []).map(function(a) { return Object.assign({}, a, { _decided: false }); });
+    var pendingIds = {};
+    pendingItems.forEach(function(a) { pendingIds[a.id] = true; });
+    var decidedItems = Object.keys(decidedCache)
+      .map(function(k) { return decidedCache[k]; })
+      .filter(function(a) { return !pendingIds[a.id]; })
+      .sort(function(a, b) { return (b.decidedAt || '').localeCompare(a.decidedAt || ''); })
+      .slice(0, 5);
+    allApprovals = pendingItems.concat(decidedItems);
+    render();
+  } catch (e) {
+    document.getElementById('status').textContent = 'Hub接続エラー: ' + e.message;
+  }
+}
+
+function render() {
+  var el = document.getElementById('list');
+  if (allApprovals.length === 0) {
+    el.innerHTML = '<div class="empty">承認待ちなし</div>';
+    return;
+  }
+  el.innerHTML = allApprovals.map(function(a) {
+    var decided = a.status === 'decided' || a._decided;
+    var badgeClass = decided
+      ? (a.decision === 'approve' ? 'badge-approve' : 'badge-deny')
+      : 'badge-pending';
+    var badgeText = decided
+      ? (a.decision === 'approve' ? '承認済' : '拒否済')
+      : 'pending';
+    var decidedBy = a.decidedBy ? ' (by ' + esc(a.decidedBy) + ')' : '';
+
+    var detail = 'Tool: ' + a.toolName;
+    if (a.cwd) detail += '\nCWD: ' + a.cwd;
+    if (a.toolInput) {
+      if (a.toolInput.command) {
+        detail += '\n\n$ ' + a.toolInput.command;
+      } else if (a.toolInput.file_path) {
+        detail += '\nFile: ' + a.toolInput.file_path;
+        if (a.toolInput.old_string) detail += '\n\n--- old ---\n' + a.toolInput.old_string.slice(0, 500);
+        if (a.toolInput.new_string) detail += '\n--- new ---\n' + a.toolInput.new_string.slice(0, 500);
+        if (a.toolInput.content) detail += '\n\n' + a.toolInput.content.slice(0, 500);
+      } else {
+        detail += '\n\n' + JSON.stringify(a.toolInput, null, 2).slice(0, 500);
+      }
+    }
+
+    var age = timeAgo(a.createdAt);
+    return '<div class="card ' + (decided ? 'decided' : '') + '">'
+      + '<div class="card-header">'
+      + '<span class="tool-name">' + esc(a.toolName) + '</span>'
+      + '<span class="badge ' + badgeClass + '">' + badgeText + decidedBy + '</span>'
+      + '</div>'
+      + '<div class="meta">' + esc(age) + ' | ' + esc(a.agentName || '') + '</div>'
+      + '<div class="detail">' + esc(detail) + '</div>'
+      + '<div class="actions">'
+      + '<button class="btn btn-approve" data-id="' + a.id + '" data-decision="approve" ' + (decided ? 'disabled' : '') + '>Approve</button>'
+      + '<button class="btn btn-deny" data-id="' + a.id + '" data-decision="deny" ' + (decided ? 'disabled' : '') + '>Deny</button>'
+      + '</div></div>';
+  }).join('');
+}
+
+document.getElementById('list').addEventListener('click', function(e) {
+  var btn = e.target.closest('[data-id][data-decision]');
+  if (btn && !btn.disabled) decide(btn.dataset.id, btn.dataset.decision);
+});
+
+async function decide(id, decision) {
+  var btns = document.querySelectorAll('[data-id="' + id + '"]');
+  btns.forEach(function(b) { b.disabled = true; });
+  try {
+    var res = await fetch(API + '/api/approvals/' + id + '/decide', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ decision: decision, source: 'web-ui' }),
+    });
+    var data = await res.json();
+    if (data.ok || res.status === 409) {
+      decidedCache[id] = Object.assign({}, data.approval || {}, { _decided: true });
+      await fetchApprovals();
+    }
+  } catch (e) {
+    btns.forEach(function(b) { b.disabled = false; });
+  }
+}
+
+function timeAgo(iso) {
+  var diff = Date.now() - new Date(iso).getTime();
+  if (diff < 60000) return Math.floor(diff / 1000) + '秒前';
+  if (diff < 3600000) return Math.floor(diff / 60000) + '分前';
+  return Math.floor(diff / 3600000) + '時間前';
+}
+
+function esc(s) {
+  var d = document.createElement('div');
+  d.textContent = String(s || '');
+  return d.innerHTML;
+}
+
+fetchApprovals();
+setInterval(fetchApprovals, 2000);
+</script>
+</body>
+</html>

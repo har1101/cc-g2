@@ -1,0 +1,13 @@
+.DS_Store
+node_modules/
+dist/
+tmp/
+plan/
+
+# Local env (Vite)
+.env
+.env.local
+.env.*.local
+
+# Claude Code local settings
+.claude/settings.local.json
