@@ -238,7 +238,7 @@ describe('Notification Hub — Approval Broker API', () => {
     expect(ids).toContain(a2.approvalId)
   })
 
-  it('same-session replacement is recorded as cleanup, not approve', async () => {
+  it('same-session approvals remain independently pending until individually resolved', async () => {
     const first = await createTestApproval({
       toolName: 'SessionTool1',
       metadata: { sessionId: 'cleanup-session-1' },
@@ -250,12 +250,17 @@ describe('Notification Hub — Approval Broker API', () => {
 
     expect(second.approvalId).toEqual(expect.any(String))
 
-    const { status, data } = await getJson(hubBase, `/api/approvals/${first.approvalId}`)
-    expect(status).toBe(200)
-    expect(data.approval.status).toBe('decided')
-    expect(data.approval.decision).toBeUndefined()
-    expect(data.approval.resolution).toBe('superseded')
-    expect(data.approval.decidedBy).toBe('auto-superseded')
+    const firstDetail = await getJson(hubBase, `/api/approvals/${first.approvalId}`)
+    const secondDetail = await getJson(hubBase, `/api/approvals/${second.approvalId}`)
+    expect(firstDetail.status).toBe(200)
+    expect(secondDetail.status).toBe(200)
+    expect(firstDetail.data.approval.status).toBe('pending')
+    expect(secondDetail.data.approval.status).toBe('pending')
+
+    const pending = await getJson(hubBase, '/api/approvals')
+    const pendingIds = pending.data.items.map((item) => item.id)
+    expect(pendingIds).toContain(first.approvalId)
+    expect(pendingIds).toContain(second.approvalId)
   })
 
   it('stop notification cleans up same-session pending approvals without approving them', async () => {
@@ -370,6 +375,8 @@ describe('Notification Hub — Approval Broker API', () => {
     )
     expect(second.status).toBe(200)
     expect(second.data.reply.resolvedAction).toBeUndefined()
+    expect(second.data.reply.result).toBe('ignored')
+    expect(second.data.reply.ignoredReason).toBe('approval-not-pending')
 
     const { data: approvalData } = await getJson(hubBase, `/api/approvals/${created.approvalId}`)
     expect(approvalData.approval.status).toBe('decided')

@@ -28,6 +28,18 @@ async function getJson(base, pathname) {
   return { status: res.status, data: await res.json() }
 }
 
+async function waitForPendingApprovals(base, predicate, expectedCount, timeoutMs = 4000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const { data } = await getJson(base, '/api/approvals')
+    const matches = data.items.filter(predicate)
+    if (matches.length >= expectedCount) return matches
+    await new Promise((r) => setTimeout(r, 100))
+  }
+  const { data } = await getJson(base, '/api/approvals')
+  return data.items.filter(predicate)
+}
+
 describe('Notification Hub — Permission Request HTTP Hook Endpoint', () => {
   /** @type {import('node:child_process').ChildProcess} */
   let hubProc
@@ -198,7 +210,7 @@ describe('Notification Hub — Permission Request HTTP Hook Endpoint', () => {
     await hookPromise
   })
 
-  it('POST /api/hooks/permission-request — superseded cleanup returns empty response, not allow', async () => {
+  it('POST /api/hooks/permission-request — concurrent same-session approvals stay independently actionable', async () => {
     const firstHookPromise = postJson(hubBase, '/api/hooks/permission-request', {
       session_id: 'supersede-session',
       cwd: '/tmp/supersede-project',
@@ -215,19 +227,123 @@ describe('Notification Hub — Permission Request HTTP Hook Endpoint', () => {
       tool_input: { command: 'echo second' },
     })
 
+    const pending = await waitForPendingApprovals(
+      hubBase,
+      (a) => a.cwd === '/tmp/supersede-project' && a.status === 'pending',
+      2,
+    )
+    expect(pending).toHaveLength(2)
+
+    const firstPending = pending.find((a) => a.toolInput?.command === 'echo first')
+    const secondPending = pending.find((a) => a.toolInput?.command === 'echo second')
+    expect(firstPending).toBeDefined()
+    expect(secondPending).toBeDefined()
+
+    await postJson(hubBase, `/api/approvals/${firstPending.id}/decide`, { decision: 'approve', source: 'g2' })
     const firstResult = await firstHookPromise
     expect(firstResult.status).toBe(200)
-    expect(firstResult.data).toEqual({})
+    expect(firstResult.data.hookSpecificOutput.decision.behavior).toBe('allow')
 
-    const { data: pendingData } = await getJson(hubBase, '/api/approvals')
-    const pending = pendingData.items.find((a) => a.cwd === '/tmp/supersede-project' && a.status === 'pending')
-    expect(pending).toBeDefined()
-    expect(pending.resolution).toBeUndefined()
-
-    await postJson(hubBase, `/api/approvals/${pending.id}/decide`, { decision: 'approve', source: 'g2' })
+    await postJson(hubBase, `/api/approvals/${secondPending.id}/decide`, { decision: 'approve', source: 'g2' })
     const secondResult = await secondHookPromise
     expect(secondResult.status).toBe(200)
     expect(secondResult.data.hookSpecificOutput.decision.behavior).toBe('allow')
+  })
+
+  it('POST /api/hooks/permission-request — replies stay bound to the matching notification when tool names collide', async () => {
+    const firstHookPromise = postJson(hubBase, '/api/hooks/permission-request', {
+      session_id: 'websearch-session',
+      cwd: '/tmp/websearch-project',
+      tool_name: 'WebSearch',
+      tool_input: { query: 'Claude Code Anthropic 2026 latest news updates' },
+    })
+    const secondHookPromise = postJson(hubBase, '/api/hooks/permission-request', {
+      session_id: 'websearch-session',
+      cwd: '/tmp/websearch-project',
+      tool_name: 'WebSearch',
+      tool_input: { query: 'Anthropic Claude Code new features 2026' },
+    })
+    const thirdHookPromise = postJson(hubBase, '/api/hooks/permission-request', {
+      session_id: 'websearch-session',
+      cwd: '/tmp/websearch-project',
+      tool_name: 'WebSearch',
+      tool_input: { query: 'Claude Code announcement 2026 release' },
+    })
+
+    await new Promise((r) => setTimeout(r, 700))
+
+    const { data: notifData } = await getJson(hubBase, '/api/notifications?limit=20')
+    const websearchNotifs = notifData.items.filter((n) => n.cwd === undefined ? true : true).filter((n) => n.title === 'WebSearch')
+    expect(websearchNotifs.length).toBeGreaterThanOrEqual(3)
+
+    const { data: pendingData } = await getJson(hubBase, '/api/approvals')
+    const pending = pendingData.items.filter((a) => a.cwd === '/tmp/websearch-project' && a.toolName === 'WebSearch')
+    expect(pending).toHaveLength(3)
+
+    for (const approval of pending) {
+      const replyRes = await postJson(hubBase, `/api/notifications/${approval.notificationId}/reply`, {
+        action: 'approve',
+        source: 'g2',
+      })
+      expect(replyRes.status).toBe(200)
+      expect(replyRes.data.reply.resolvedAction).toBe('approve')
+    }
+
+    const [firstResult, secondResult, thirdResult] = await Promise.all([
+      firstHookPromise,
+      secondHookPromise,
+      thirdHookPromise,
+    ])
+    expect(firstResult.data.hookSpecificOutput.decision.behavior).toBe('allow')
+    expect(secondResult.data.hookSpecificOutput.decision.behavior).toBe('allow')
+    expect(thirdResult.data.hookSpecificOutput.decision.behavior).toBe('allow')
+  })
+
+  it('POST /api/hooks/permission-request — same tool across multiple tmux targets can be approved independently', async () => {
+    const sessionAHookPromise = postJson(
+      hubBase,
+      '/api/hooks/permission-request',
+      {
+        session_id: 'multi-tmux-a',
+        cwd: '/tmp/multi-tmux-a',
+        tool_name: 'WebSearch',
+        tool_input: { query: 'tmux target A' },
+      },
+      { 'X-Tmux-Target': 'cc-g2-a:0.0' },
+    )
+    const sessionBHookPromise = postJson(
+      hubBase,
+      '/api/hooks/permission-request',
+      {
+        session_id: 'multi-tmux-b',
+        cwd: '/tmp/multi-tmux-b',
+        tool_name: 'WebSearch',
+        tool_input: { query: 'tmux target B' },
+      },
+      { 'X-Tmux-Target': 'cc-g2-b:0.0' },
+    )
+
+    await new Promise((r) => setTimeout(r, 700))
+
+    const { data: notifData } = await getJson(hubBase, '/api/notifications?limit=20')
+    const notifA = notifData.items.find((n) => n.metadata?.tmuxTarget === 'cc-g2-a:0.0')
+    const notifB = notifData.items.find((n) => n.metadata?.tmuxTarget === 'cc-g2-b:0.0')
+    expect(notifA).toBeDefined()
+    expect(notifB).toBeDefined()
+    expect(notifA.id).not.toBe(notifB.id)
+
+    const { data: pendingData } = await getJson(hubBase, '/api/approvals')
+    const approvalA = pendingData.items.find((a) => a.notificationId === notifA.id)
+    const approvalB = pendingData.items.find((a) => a.notificationId === notifB.id)
+    expect(approvalA).toBeDefined()
+    expect(approvalB).toBeDefined()
+
+    await postJson(hubBase, `/api/notifications/${notifB.id}/reply`, { action: 'approve', source: 'g2' })
+    await postJson(hubBase, `/api/notifications/${notifA.id}/reply`, { action: 'approve', source: 'g2' })
+
+    const [resultA, resultB] = await Promise.all([sessionAHookPromise, sessionBHookPromise])
+    expect(resultA.data.hookSpecificOutput.decision.behavior).toBe('allow')
+    expect(resultB.data.hookSpecificOutput.decision.behavior).toBe('allow')
   })
 
   it('POST /api/hooks/permission-request — terminal disconnect is recorded as cleanup', async () => {
