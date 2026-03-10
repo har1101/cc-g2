@@ -273,7 +273,9 @@ describe('Notification Hub — Permission Request HTTP Hook Endpoint', () => {
     await new Promise((r) => setTimeout(r, 700))
 
     const { data: notifData } = await getJson(hubBase, '/api/notifications?limit=20')
-    const websearchNotifs = notifData.items.filter((n) => n.cwd === undefined ? true : true).filter((n) => n.title === 'WebSearch')
+    const websearchNotifs = notifData.items
+      .filter((n) => n.metadata?.cwd === '/tmp/websearch-project' && n.metadata?.sessionId === 'websearch-session')
+      .filter((n) => n.title === 'WebSearch')
     expect(websearchNotifs.length).toBeGreaterThanOrEqual(3)
 
     const { data: pendingData } = await getJson(hubBase, '/api/approvals')
