@@ -149,6 +149,51 @@ describe('hub stt-stream route (Pass 1)', () => {
     await once(ws, 'close')
   })
 
+  it('accepts token via Sec-WebSocket-Protocol subprotocol (browser path)', async () => {
+    const factory = fakeEngineFactory()
+    env = await startTestServer({
+      hubAuthToken: 'secret',
+      createSttEngine: factory.createEngine,
+    })
+    // Browsers can't set arbitrary headers but can negotiate subprotocols.
+    const ws = new WebSocket(env.url, ['cc-g2-token.secret'])
+    await once(ws, 'open')
+    expect(ws.readyState).toBe(WebSocket.OPEN)
+    expect(ws.protocol).toBe('cc-g2-token.secret')
+    ws.close()
+    await once(ws, 'close')
+  })
+
+  it('accepts token via ?token= query string (older browser fallback)', async () => {
+    const factory = fakeEngineFactory()
+    env = await startTestServer({
+      hubAuthToken: 'secret',
+      createSttEngine: factory.createEngine,
+    })
+    const ws = new WebSocket(`${env.url}?token=secret`)
+    await once(ws, 'open')
+    expect(ws.readyState).toBe(WebSocket.OPEN)
+    ws.close()
+    await once(ws, 'close')
+  })
+
+  it('rejects when subprotocol token is wrong', async () => {
+    const factory = fakeEngineFactory()
+    env = await startTestServer({
+      hubAuthToken: 'secret',
+      createSttEngine: factory.createEngine,
+    })
+    const ws = new WebSocket(env.url, ['cc-g2-token.bad'])
+    const result = await new Promise((resolve) => {
+      ws.on('error', (err) => resolve({ kind: 'error', err }))
+      ws.on('unexpected-response', (_req, res) => resolve({ kind: 'http', status: res.statusCode }))
+      ws.on('open', () => resolve({ kind: 'open' }))
+    })
+    if (result.kind === 'open') ws.close()
+    expect(result.kind).not.toBe('open')
+    if (result.kind === 'http') expect(result.status).toBe(401)
+  })
+
   it('rate-limits beyond maxConcurrent', async () => {
     const factory = fakeEngineFactory()
     env = await startTestServer({

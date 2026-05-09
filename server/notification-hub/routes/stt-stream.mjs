@@ -275,7 +275,18 @@ export function attachSttStreamWss(httpServer, deps) {
     throw new Error('attachSttStreamWss: createSttEngine is required')
   }
 
-  const wss = new WebSocketServer({ noServer: true })
+  // handleProtocols: when the browser advertises `cc-g2-token.<token>` we echo
+  // it back so the connection completes. ws default would otherwise reject the
+  // subprotocol and break the auth path used by browsers.
+  const wss = new WebSocketServer({
+    noServer: true,
+    handleProtocols: (offered) => {
+      for (const p of offered) {
+        if (typeof p === 'string' && p.startsWith('cc-g2-token.')) return p
+      }
+      return false
+    },
+  })
 
   httpServer.on('upgrade', (req, socket, head) => {
     if (!req.url || !req.url.startsWith(STREAM_PATH)) {
@@ -284,12 +295,27 @@ export function attachSttStreamWss(httpServer, deps) {
       return
     }
 
-    // Auth check.
+    // Auth check. Browsers cannot set arbitrary headers on the WS upgrade,
+    // so we accept the token via three transport channels in priority order:
+    //   1. `X-CC-G2-Token` header (Node ws clients, curl)
+    //   2. `Sec-WebSocket-Protocol: cc-g2-token.<token>` subprotocol (browsers)
+    //   3. `?token=<token>` query string (fallback for older browsers)
     if (hubAuthToken) {
-      const provided = String(req.headers['x-cc-g2-token'] || '').trim()
+      const headerToken = String(req.headers['x-cc-g2-token'] || '').trim()
+      const protoHeader = String(req.headers['sec-websocket-protocol'] || '')
+      const subprotoToken = protoHeader
+        .split(',')
+        .map((p) => p.trim())
+        .filter((p) => p.startsWith('cc-g2-token.'))
+        .map((p) => p.slice('cc-g2-token.'.length))[0] || ''
+      let queryToken = ''
+      try {
+        const u = new URL(req.url, 'http://localhost')
+        queryToken = u.searchParams.get('token')?.trim() || ''
+      } catch { /* invalid URL — leave queryToken empty */ }
+
+      const provided = headerToken || subprotoToken || queryToken
       if (provided !== hubAuthToken) {
-        // RFC 6455 disallows non-101 status with a body for the upgrade
-        // handshake itself, but we can short-circuit at the socket layer.
         socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n')
         socket.destroy()
         return
