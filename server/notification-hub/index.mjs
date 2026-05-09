@@ -47,6 +47,13 @@ import {
   bootstrap as persistenceBootstrap,
   buildPaths,
 } from './state/persistence.mjs'
+import {
+  addNotification as notificationServiceAdd,
+  forwardReplyIfConfigured,
+  getReplyStatus,
+  listNotifications,
+  persistReply,
+} from './services/notification-service.mjs'
 
 const legacyHubBind = process.env.HUB_BIND
 const bindModeRaw = process.env.HUB_BIND_MODE
@@ -115,55 +122,23 @@ function requireApiAuth(req, res) {
   return coreRequireApiAuth(req, res, hubAuthToken)
 }
 
+// Thin wrapper that injects hub-level config and applies the stop-hook
+// auto-cleanup side effect. The service itself stays free of approval-layer
+// knowledge; this glue keeps the DAG clean (route → notification-service,
+// route → approval-service) without splitting addNotification's call sites.
 async function addNotification(payload, logPrefix = 'notification') {
-  const item = normalizeMoshiPayload(payload, {
+  const result = await notificationServiceAdd(payload, logPrefix, {
     persistRaw: hubPersistRaw,
-    createId: () => randomUUID(),
+    permissionThreadDedupMs: hubPermissionThreadDedupMs,
+    notificationsFile,
   })
-  const extId =
-    item && item.metadata && typeof item.metadata.externalId === 'string'
-      ? item.metadata.externalId
-      : ''
+  if (result.duplicate) return result
+
+  const item = result.item
   const hookType =
     item && item.metadata && typeof item.metadata.hookType === 'string'
       ? item.metadata.hookType
       : ''
-  const threadId =
-    item && item.metadata && typeof item.metadata.threadId === 'string'
-      ? item.metadata.threadId
-      : ''
-  const hasApprovalId =
-    item &&
-    item.metadata &&
-    (typeof item.metadata.approvalId === 'string' ||
-      typeof item.metadata.approvalId === 'number')
-
-  // Some hook-originated notifications can arrive almost simultaneously from
-  // multiple hook sources. Dedup by threadId only in a short TTL window to avoid
-  // dropping legitimate later events.
-  if (
-    hubPermissionThreadDedupMs > 0 &&
-    (hookType === 'permission-request' || hookType === 'stop') &&
-    !hasApprovalId &&
-    threadId
-  ) {
-    const nowMs = Date.now()
-    const lastMs = permissionThreadSeenAt.get(threadId) || 0
-    if (nowMs - lastMs < hubPermissionThreadDedupMs) {
-      return { ok: true, duplicate: true, item }
-    }
-    permissionThreadSeenAt.set(threadId, nowMs)
-  }
-
-  if (extId && notificationExternalIds.has(extId)) {
-    return { ok: true, duplicate: true, item }
-  }
-
-  notifications.push(item)
-  notificationsById.set(item.id, item)
-  if (extId) notificationExternalIds.add(extId)
-  await appendJsonl(notificationsFile, persistedNotification(item, { persistRaw: hubPersistRaw }))
-
   // stop通知が来たら同セッションの全pending承認を自動解決
   if (hookType === 'stop') {
     const sessionId = item.metadata?.sessionId
@@ -180,32 +155,7 @@ async function addNotification(payload, logPrefix = 'notification') {
       }
     }
   }
-
-  log(
-    `${logPrefix} received id=${item.id} title=${JSON.stringify(item.title)} summary=${JSON.stringify(item.summary)}`,
-  )
-  return { ok: true, duplicate: false, item }
-}
-
-
-async function forwardReplyIfConfigured(record) {
-  const url = process.env.MOSHI_REPLY_WEBHOOK_URL
-  if (!url) {
-    return { status: 'stubbed' }
-  }
-  try {
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(record),
-    })
-    if (!resp.ok) {
-      return { status: 'failed', error: `HTTP ${resp.status}` }
-    }
-    return { status: 'forwarded' }
-  } catch (err) {
-    return { status: 'failed', error: err instanceof Error ? err.message : String(err) }
-  }
+  return result
 }
 
 async function relayReplyIfConfigured(payload, opts = {}) {
@@ -270,52 +220,6 @@ async function relayReplyIfConfigured(payload, opts = {}) {
     child.stdin.write(JSON.stringify(payload))
     child.stdin.end()
   })
-}
-
-function getReplyStatus(item) {
-  const approval = approvalsByNotificationId.get(item.id)
-  if (approval) {
-    if (approval.deliveredAt) return 'delivered'
-    if (approval.status === 'decided') return 'decided'
-    return 'pending'
-  }
-  const hasReply = replies.some((r) => r.notificationId === item.id)
-  if (hasReply) return 'replied'
-  // 非approval通知（stop hookなど）: 同セッションの新しい通知があれば暗黙的に対応済み
-  // PC側のコメントはHubを経由しないため、後続通知の存在で判定する
-  // sessionIdがない通知（stop hookなど）はtmuxTargetとcwdで同一セッション判定
-  if (item.replyCapable && item.metadata) {
-    const sid = item.metadata.sessionId
-    const tmux = item.metadata.tmuxTarget
-    const cwd = item.metadata.cwd
-    const t = new Date(item.createdAt).getTime()
-    const isSameSession = (n) => {
-      if (!n.metadata) return false
-      if (sid && n.metadata.sessionId === sid) return true
-      if (tmux && n.metadata.tmuxTarget === tmux) return true
-      if (!sid && !tmux && cwd && n.metadata.cwd === cwd) return true
-      return false
-    }
-    const hasNewer = notifications.some((n) =>
-      n.id !== item.id && isSameSession(n) && new Date(n.createdAt).getTime() > t,
-    )
-    if (hasNewer) return 'delivered'
-  }
-  return undefined
-}
-
-function listNotifications(limit) {
-  const sorted = [...notifications].sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))
-  return sorted.slice(0, limit).map((item) => ({
-    id: item.id,
-    source: item.source,
-    title: item.title,
-    summary: item.summary,
-    createdAt: item.createdAt,
-    replyCapable: item.replyCapable,
-    metadata: item.metadata,
-    replyStatus: getReplyStatus(item),
-  }))
 }
 
 async function createApproval(params) {
