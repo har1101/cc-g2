@@ -54,6 +54,20 @@ export type NotificationReplyRequest = {
   answerData?: Record<string, string>
 }
 
+export type CommandRequest = {
+  source: 'g2_voice' | 'g2_text'
+  text: string
+  transcript_confidence?: number
+  tmux_target?: string
+}
+
+export type CommandResponse = {
+  ok: boolean
+  delivered_at?: string
+  relay?: 'stubbed'
+  error?: string
+}
+
 export function createNotificationClient(baseUrl: string) {
   async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
     const res = await fetch(`${baseUrl}${path}`, init)
@@ -99,6 +113,14 @@ export function createNotificationClient(baseUrl: string) {
           body: JSON.stringify(body),
         },
       )
+    },
+
+    async sendCommand(req: CommandRequest): Promise<CommandResponse> {
+      return fetchJson<CommandResponse>(`/api/v1/command`, {
+        method: 'POST',
+        headers: createHubHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify(req),
+      })
     },
   }
 }

@@ -36,7 +36,19 @@ export type AskQuestionData = {
 
 /** G2ディスプレイ上の通知UIの状態 */
 export type NotificationUIState = {
-  screen: 'idle' | 'list' | 'detail' | 'detail-actions' | 'ask-question' | 'reply-recording' | 'reply-confirm' | 'reply-sending'
+  screen:
+    | 'idle'
+    | 'list'
+    | 'detail'
+    | 'detail-actions'
+    | 'ask-question'
+    | 'reply-recording'
+    | 'reply-confirm'
+    | 'reply-sending'
+    | 'voice-command-recording'
+    | 'voice-command-confirm'
+    | 'voice-command-sending'
+    | 'voice-command-done'
   items: NotificationItem[]
   selectedIndex: number
   /** detail画面のページ送り用（fullTextを複数ページに分割） */
@@ -239,7 +251,7 @@ function formatCurrentDateTime(now = new Date()): string {
 export function createGlassesUI() {
   // The host treats startup-page creation as one-time init; later UI changes should use rebuild.
   const startupRenderedBridges = new WeakSet<object>()
-  const layoutByBridge = new WeakMap<object, 'base' | 'text' | 'idle-launcher' | 'approval' | 'notif-list' | 'notif-detail' | 'notif-actions' | 'ask-question' | 'reply-recording' | 'reply-confirm' | 'reply-result'>()
+  const layoutByBridge = new WeakMap<object, 'base' | 'text' | 'idle-launcher' | 'approval' | 'notif-list' | 'notif-detail' | 'notif-actions' | 'ask-question' | 'reply-recording' | 'reply-confirm' | 'reply-result' | 'vc-recording' | 'vc-confirm' | 'vc-sending' | 'vc-done'>()
   const bridgeKeyOf = (conn: BridgeConnection) => conn.bridge as unknown as object
 
   // 描画ロック: SDK呼び出しの同時実行を防ぐ（実機で衝突するとG2が固まる）
@@ -899,6 +911,174 @@ export function createGlassesUI() {
       })
       layoutByBridge.set(bridgeKeyOf(conn), 'reply-result')
       log(`G2に返信結果表示: ${success ? '成功' : '失敗'}`)
+    },
+
+    /**
+     * 音声コマンド録音中画面
+     */
+    async showVoiceCommandRecording(
+      conn: BridgeConnection,
+      opts?: { elapsedMs?: number; bytes?: number },
+    ): Promise<void> {
+      if (!conn.bridge) {
+        log('[Mock] G2 voice-command 録音中')
+        return
+      }
+
+      const seconds = Math.max(0, Math.floor((opts?.elapsedMs ?? 0) / 1000))
+      const bodyText = `● 録音中 ${seconds}s\n\nTap = 停止 / 送信\nDblTap = キャンセル`
+
+      const headerContainer = new TextContainerProperty({
+        xPosition: 8,
+        yPosition: 4,
+        width: 560,
+        height: 28,
+        containerID: 1,
+        containerName: 'vc-rec-hdr',
+        content: 'Voice Command',
+        isEventCapture: 0,
+      })
+
+      const bodyContainer = new TextContainerProperty({
+        xPosition: 8,
+        yPosition: 36,
+        width: 560,
+        height: 240,
+        containerID: 2,
+        containerName: 'vc-rec-body',
+        content: bodyText,
+        isEventCapture: 1,
+      })
+
+      await renderStartupPage(conn, {
+        texts: [headerContainer, bodyContainer],
+        targetLayout: 'vc-recording',
+      })
+      layoutByBridge.set(bridgeKeyOf(conn), 'vc-recording')
+      log(`G2 voice-command 録音中表示: ${seconds}s`)
+    },
+
+    /**
+     * 音声コマンド確認画面（STT結果プレビュー）
+     */
+    async showVoiceCommandConfirm(conn: BridgeConnection, sttText: string): Promise<void> {
+      if (!conn.bridge) {
+        log(`[Mock] G2 voice-command 確認: "${sttText}"`)
+        return
+      }
+
+      const pages = paginateText(sttText || '（認識結果なし）')
+      const preview = pages[0]
+      const bodyText = `${preview}\n\nTap = 送信 / DblTap = キャンセル`
+
+      const headerContainer = new TextContainerProperty({
+        xPosition: 8,
+        yPosition: 4,
+        width: 560,
+        height: 28,
+        containerID: 1,
+        containerName: 'vc-cfm-hdr',
+        content: 'Voice Command',
+        isEventCapture: 0,
+      })
+
+      const bodyContainer = new TextContainerProperty({
+        xPosition: 8,
+        yPosition: 36,
+        width: 560,
+        height: 240,
+        containerID: 2,
+        containerName: 'vc-cfm-body',
+        content: bodyText,
+        isEventCapture: 1,
+      })
+
+      await renderStartupPage(conn, {
+        texts: [headerContainer, bodyContainer],
+        targetLayout: 'vc-confirm',
+      })
+      layoutByBridge.set(bridgeKeyOf(conn), 'vc-confirm')
+      log(`G2 voice-command 確認表示: "${preview.slice(0, 40)}"`)
+    },
+
+    /**
+     * 音声コマンド送信中画面
+     */
+    async showVoiceCommandSending(conn: BridgeConnection): Promise<void> {
+      if (!conn.bridge) {
+        log('[Mock] G2 voice-command 送信中')
+        return
+      }
+
+      const headerContainer = new TextContainerProperty({
+        xPosition: 8,
+        yPosition: 4,
+        width: 560,
+        height: 28,
+        containerID: 1,
+        containerName: 'vc-snd-hdr',
+        content: 'Voice Command',
+        isEventCapture: 0,
+      })
+
+      const bodyContainer = new TextContainerProperty({
+        xPosition: 8,
+        yPosition: 36,
+        width: 560,
+        height: 240,
+        containerID: 2,
+        containerName: 'vc-snd-body',
+        content: '送信中...',
+        isEventCapture: 1,
+      })
+
+      await renderStartupPage(conn, {
+        texts: [headerContainer, bodyContainer],
+        targetLayout: 'vc-sending',
+      })
+      layoutByBridge.set(bridgeKeyOf(conn), 'vc-sending')
+      log('G2 voice-command 送信中表示')
+    },
+
+    /**
+     * 音声コマンド送信完了/失敗画面
+     */
+    async showVoiceCommandDone(conn: BridgeConnection, ok: boolean): Promise<void> {
+      if (!conn.bridge) {
+        log(`[Mock] G2 voice-command 完了: ${ok ? '送信済み' : '送信失敗'}`)
+        return
+      }
+
+      const bodyText = ok ? '✓ 送信済み' : '✗ 送信失敗'
+
+      const headerContainer = new TextContainerProperty({
+        xPosition: 8,
+        yPosition: 4,
+        width: 560,
+        height: 28,
+        containerID: 1,
+        containerName: 'vc-done-hdr',
+        content: 'Voice Command',
+        isEventCapture: 0,
+      })
+
+      const bodyContainer = new TextContainerProperty({
+        xPosition: 8,
+        yPosition: 36,
+        width: 560,
+        height: 240,
+        containerID: 2,
+        containerName: 'vc-done-body',
+        content: bodyText,
+        isEventCapture: 1,
+      })
+
+      await renderStartupPage(conn, {
+        texts: [headerContainer, bodyContainer],
+        targetLayout: 'vc-done',
+      })
+      layoutByBridge.set(bridgeKeyOf(conn), 'vc-done')
+      log(`G2 voice-command 完了表示: ${ok ? 'ok' : 'fail'}`)
     },
 
     /**
