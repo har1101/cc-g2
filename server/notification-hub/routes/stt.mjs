@@ -1,7 +1,11 @@
-// /api/stt/transcriptions — wraps the Groq Whisper proxy in stt.mjs
+// /api/stt/transcriptions — wraps the Groq Whisper proxy in stt/groq-engine.mjs
 import { getString, readRequestBody, safeJsonParse } from '../notification-utils.mjs'
 import { isBodyTooLargeError, sendJson, sendRequestBodyTooLarge } from '../core/http.mjs'
-import { transcribeAudioWithGroq } from '../stt.mjs'
+import { createGroqEngine } from '../stt/groq-engine.mjs'
+
+// 1.5c では engine は 1 種類なので module-load 時に 1 度作る。
+// Phase 2 で deepgram engine を追加したら、 deps から選択する形にする。
+const engine = createGroqEngine()
 
 export async function handle(req, res, ctx) {
   if (ctx.method !== 'POST' || ctx.pathname !== '/api/stt/transcriptions') return false
@@ -28,7 +32,7 @@ export async function handle(req, res, ctx) {
     sendJson(res, 400, { ok: false, error: '`audioBase64` is required' })
     return true
   }
-  const result = await transcribeAudioWithGroq(
+  const result = await engine.transcribe(
     {
       audioBase64,
       mimeType: getString(p.mimeType),
