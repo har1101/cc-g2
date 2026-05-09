@@ -22,6 +22,7 @@ import {
 } from './state/store'
 import { createAudioSession, type AudioSession, type AudioSessionHandle } from './audio-session'
 import { createRenderQueue, type RenderQueue } from './render-queue'
+import { createEventDispatcher, type EventDispatcher } from './event-dispatcher'
 
 const appRoot = document.querySelector<HTMLDivElement>('#app')!
 const uiSearch = new URLSearchParams(globalThis.location?.search || '')
@@ -153,6 +154,13 @@ const renderQueue: RenderQueue = createRenderQueue({
 function isAnyRendering(): boolean {
   return glassesUI.isRendering() || renderQueue.isRendering()
 }
+
+/**
+ * 単一の onEvent 受け口 (Phase 1.5b)。
+ * 1.5b では既存の `handleNotifEvent` を 1 つだけ setHandler して既存挙動と同等。
+ * 1.5c で screen 別 handler に切り替える時にここだけ触れば済むようにする。
+ */
+const eventDispatcher: EventDispatcher = createEventDispatcher({ log: (msg) => log(msg) })
 
 const DETAIL_SCROLL_COOLDOWN_MS = 250
 const TAP_SCROLL_SUPPRESS_MS = 150
@@ -1129,12 +1137,13 @@ function shouldIgnoreDetailScroll(eventType: number | undefined): boolean {
   return false
 }
 
-// G2イベントリスナーを接続に登録（再接続時は新しい eventHandlers 配列になるため再登録が必要）
+// G2 イベントリスナーは event-dispatcher 経由で 1 度だけ登録 (Phase 1.5b)。
+// 再接続時 (= conn が変わる) は dispatcher 内部で新しい conn に再 attach する。
 function ensureNotifEventHandler(conn: BridgeConnection) {
   if (store.dashboard.notifEventRegisteredFor === conn) return
-  conn.onEvent((event) => {
-      void handleNotifEvent(conn, event)
-  })
+  // setHandler は 1 度で十分だが、 idempotent なので毎回呼んでも問題ない。
+  eventDispatcher.setHandler((event) => handleNotifEvent(conn, event))
+  eventDispatcher.attach(conn)
   store.dashboard.notifEventRegisteredFor = conn
 }
 
