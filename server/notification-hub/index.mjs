@@ -1,7 +1,6 @@
 import { createServer } from 'node:http'
 import { randomUUID } from 'node:crypto'
-import { createReadStream } from 'node:fs'
-import { mkdir, readdir, readFile, appendFile, stat } from 'node:fs/promises'
+import { readFile } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import path from 'node:path'
 import {
@@ -30,6 +29,24 @@ import {
   isPublicApiRequest,
   requireApiAuth as coreRequireApiAuth,
 } from './core/auth.mjs'
+import {
+  approvals,
+  approvalsById,
+  approvalsByNotificationId,
+  contextStatusBySession,
+  getLastLocation,
+  notificationExternalIds,
+  notifications,
+  notificationsById,
+  permissionThreadSeenAt,
+  replies,
+  setLastLocation,
+} from './state/store.mjs'
+import {
+  appendJsonl,
+  bootstrap as persistenceBootstrap,
+  buildPaths,
+} from './state/persistence.mjs'
 
 const legacyHubBind = process.env.HUB_BIND
 const bindModeRaw = process.env.HUB_BIND_MODE
@@ -68,9 +85,7 @@ const hubPersistRaw = ['1', 'true', 'yes', 'on'].includes(String(process.env.HUB
 const hubPersistToolInput = ['1', 'true', 'yes', 'on'].includes(String(process.env.HUB_PERSIST_TOOL_INPUT || '').toLowerCase())
 const groqApiKey = String(process.env.GROQ_API_KEY || '').trim()
 const groqModelDefault = String(process.env.GROQ_MODEL || 'whisper-large-v3').trim()
-const notificationsFile = path.join(dataDir, 'notifications.jsonl')
-const repliesFile = path.join(dataDir, 'replies.jsonl')
-const clientEventsFile = path.join(dataDir, 'client-events.jsonl')
+const { notificationsFile, repliesFile, clientEventsFile, approvalsFile } = buildPaths({ dataDir })
 const hubReplyRelayCmd = String(process.env.HUB_REPLY_RELAY_CMD || '').trim()
 const hubReplyRelayTimeoutMs = Math.max(
   1000,
@@ -95,54 +110,6 @@ const hubMaxSttBodyBytes = Math.max(
   hubMaxBodyBytes,
   Number.parseInt(process.env.HUB_MAX_STT_BODY_BYTES || '12582912', 10) || 12582912,
 )
-
-/** @typedef {{id:string,source:'moshi'|'claude-code',title:string,summary:string,fullText:string,createdAt:string,replyCapable:boolean,raw?:unknown,metadata?:Record<string, unknown>}} NotificationItem */
-/** @typedef {{id:string,notificationId:string,replyText:string,createdAt:string,status:'stubbed'|'forwarded'|'failed',action?:'approve'|'deny'|'comment',resolvedAction?:'approve'|'deny'|'comment',result?:'resolved'|'relayed'|'ignored',ignoredReason?:'approval-not-pending'|'approval-link-not-found',comment?:string,source?:string,error?:string}} ReplyRecord */
-/** @typedef {{id:string,notificationId:string,source:string,toolName:string,toolInput:unknown,toolId:string,cwd:string,reason:string,agentName:string,status:'pending'|'decided'|'expired',decision?:'approve'|'deny',resolution?:'superseded'|'session-ended'|'terminal-disconnect',comment?:string,decidedBy?:string,createdAt:string,decidedAt?:string,deliveredAt?:string}} ApprovalRecord */
-
-/** @type {NotificationItem[]} */
-const notifications = []
-/** @type {Map<string, NotificationItem>} */
-const notificationsById = new Map()
-/** @type {ReplyRecord[]} */
-const replies = []
-/** @type {Set<string>} */
-const notificationExternalIds = new Set()
-/** @type {Map<string, number>} */
-const permissionThreadSeenAt = new Map()
-/** @type {Map<string, {sessionId:string,cwd:string,usedPercentage:number,model:string,updatedAt:string}>} */
-const contextStatusBySession = new Map()
-/** @type {ApprovalRecord[]} */
-const approvals = []
-/** @type {Map<string, ApprovalRecord>} */
-const approvalsById = new Map()
-/** @type {Map<string, ApprovalRecord>} */
-const approvalsByNotificationId = new Map()
-/** @type {{lat:number,lng:number,altitude:number|null,timestamp:string,speed:number|null,battery:number|null,receivedAt:string}|null} */
-let lastLocation = null
-const approvalsFile = path.join(dataDir, 'approvals.jsonl')
-
-async function ensureDataDir() {
-  await mkdir(dataDir, { recursive: true })
-}
-
-async function loadJsonl(filePath) {
-  try {
-    const raw = await readFile(filePath, 'utf8')
-    return raw
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .map((line) => JSON.parse(line))
-  } catch (err) {
-    if (err && typeof err === 'object' && 'code' in err && err.code === 'ENOENT') return []
-    throw err
-  }
-}
-
-async function appendJsonl(filePath, obj) {
-  await appendFile(filePath, `${JSON.stringify(obj)}\n`, 'utf8')
-}
 
 function requireApiAuth(req, res) {
   return coreRequireApiAuth(req, res, hubAuthToken)
@@ -467,44 +434,7 @@ function matchApprovalDecidePath(pathname) {
 }
 
 async function bootstrap() {
-  await ensureDataDir()
-  const storedNotifications = await loadJsonl(notificationsFile)
-  for (const item of storedNotifications) {
-    notifications.push(item)
-    if (item && item.id) notificationsById.set(item.id, item)
-    const extId =
-      item &&
-      item.metadata &&
-      typeof item.metadata === 'object' &&
-      typeof item.metadata.externalId === 'string'
-        ? item.metadata.externalId
-        : ''
-    if (extId) notificationExternalIds.add(extId)
-  }
-  const storedReplies = await loadJsonl(repliesFile)
-  for (const reply of storedReplies) replies.push(reply)
-  const storedApprovals = await loadJsonl(approvalsFile)
-  for (const a of storedApprovals) {
-    if (a && a.id && !a._event) {
-      approvals.push(a)
-      approvalsById.set(a.id, a)
-      if (a.notificationId) approvalsByNotificationId.set(a.notificationId, a)
-    } else if (a && a._event === 'decided' && a.id) {
-      const existing = approvalsById.get(a.id)
-      if (existing) {
-        existing.status = a.status
-        existing.decision = a.decision
-        existing.resolution = a.resolution
-        existing.comment = a.comment
-        existing.decidedBy = a.decidedBy
-        existing.decidedAt = a.decidedAt
-        if (a.deliveredAt) existing.deliveredAt = a.deliveredAt
-      }
-    }
-  }
-  log(
-    `notification-hub loaded notifications=${notifications.length} replies=${replies.length} approvals=${approvals.length} dataDir=${dataDir}`,
-  )
+  await persistenceBootstrap({ dataDir, notificationsFile, repliesFile, approvalsFile })
 }
 
 function matchNotificationDetail(pathname) {
@@ -846,7 +776,7 @@ const handler = async (req, res) => {
       const props = latest.properties && typeof latest.properties === 'object' ? latest.properties : {}
       const spd = Number(props.speed)
       const bat = Number(props.battery_level)
-      lastLocation = {
+      const updated = {
         lat,
         lng,
         altitude: Number.isFinite(alt) ? alt : null,
@@ -855,16 +785,18 @@ const handler = async (req, res) => {
         battery: Number.isFinite(bat) ? bat : null,
         receivedAt: new Date().toISOString(),
       }
-      log(`location updated: lat=${lastLocation.lat} lng=${lastLocation.lng}`)
+      setLastLocation(updated)
+      log(`location updated: lat=${updated.lat} lng=${updated.lng}`)
     }
     return sendJson(res, 200, { ok: true })
   }
 
   if (method === 'GET' && pathname === '/api/location') {
-    if (!lastLocation) {
+    const loc = getLastLocation()
+    if (!loc) {
       return sendJson(res, 200, { ok: true, location: null, message: 'No location data received yet' })
     }
-    return sendJson(res, 200, { ok: true, location: lastLocation })
+    return sendJson(res, 200, { ok: true, location: loc })
   }
 
   if (method === 'POST' && pathname === '/api/stt/transcriptions') {
