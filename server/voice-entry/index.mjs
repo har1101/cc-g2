@@ -12,6 +12,11 @@ const HOST = process.env.CC_G2_VOICE_ENTRY_BIND || '0.0.0.0'
 const PORT = Number(process.env.CC_G2_VOICE_ENTRY_PORT || '8797')
 const VOICE_ENTRY_TOKEN = resolveVoiceEntryToken()
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude'
+// Phase 3: Voice entry registers each launched session with the Hub so it
+// shows up in the G2 SessionList. The token comes from cc-g2.sh which
+// generates it once and shares it with both Hub and voice-entry.
+const HUB_URL = (process.env.HUB_URL || 'http://127.0.0.1:8787').trim()
+const HUB_AUTH_TOKEN = (process.env.HUB_AUTH_TOKEN || '').trim()
 const VOICE_ENTRY_LOG_FILE =
   process.env.CC_G2_VOICE_ENTRY_LOG_FILE ||
   path.join(PROJECT_DIR, 'tmp/voice-entry/voice-entry.log')
@@ -596,6 +601,66 @@ function continueCcG2Session(prompt, sessionName) {
   return runCcG2Command(['send', '--session', sessionName, '--text', prompt])
 }
 
+/**
+ * Phase 3: register the session with the Hub so it appears in the G2
+ * SessionList. Best-effort — failures are logged but never fail the launch
+ * response, since the legacy voice-entry flow predates the SessionList API.
+ *
+ * The session_id is deterministic (sessionName) so that repeat continues
+ * register-update the same row instead of creating duplicates. Voice-entry
+ * launches register under the `_unmanaged` project (not in the SessionList
+ * project allowlist; just a sentinel for sessions started outside of
+ * pull-to-new-session).
+ */
+async function registerSessionWithHub({ sessionName, tmuxTarget, workdir, agentMode }) {
+  if (!HUB_AUTH_TOKEN) {
+    appendLog({ type: 'session_register_skip', reason: 'no_token', sessionName })
+    return
+  }
+  if (!sessionName || !tmuxTarget) {
+    appendLog({ type: 'session_register_skip', reason: 'missing_target', sessionName })
+    return
+  }
+  const backend = agentMode === 'codex' ? 'codex-cli' : 'claude-code'
+  const label = (path.basename(workdir || '') || sessionName).slice(0, 40)
+  const body = {
+    session_id: `voice-${sessionName}`,
+    label,
+    backend,
+    project_id: '_unmanaged',
+    tmux_target: tmuxTarget,
+    source: 'voice-entry',
+  }
+  try {
+    const res = await fetch(`${HUB_URL}/api/v1/sessions/register`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CC-G2-Token': HUB_AUTH_TOKEN,
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(5000),
+    })
+    const text = await res.text()
+    let parsed = null
+    try { parsed = JSON.parse(text) } catch { /* ignore */ }
+    appendLog({
+      type: 'session_register',
+      status: res.status,
+      ok: res.ok,
+      sessionName,
+      tmuxTarget,
+      response: parsed || text.slice(0, 200),
+    })
+  } catch (err) {
+    appendLog({
+      type: 'session_register_error',
+      sessionName,
+      message: err instanceof Error ? err.message : String(err),
+    })
+  }
+}
+
 function runClaude(prompt) {
   const args = [
     '-p',
@@ -745,6 +810,17 @@ const server = http.createServer((req, res) => {
         const content = canContinue
           ? `既存の${agentLabel}セッションに続けて依頼しました。作業場所は ${path.basename(effectiveWorkdir)} です。結果はG2通知で返ります。`
           : `新しい${agentLabel}セッションを開始しました。作業場所は ${path.basename(effectiveWorkdir)} です。結果はG2通知で返ります。`
+
+        // Phase 3: surface this session in the G2 SessionList. Best-effort.
+        const tmuxTargetForRegister =
+          launch.tmuxTarget ||
+          (effectiveSessionName ? `${effectiveSessionName}:0.0` : '')
+        await registerSessionWithHub({
+          sessionName: effectiveSessionName,
+          tmuxTarget: tmuxTargetForRegister,
+          workdir: effectiveWorkdir,
+          agentMode,
+        })
 
         writeLastSession({
           sessionName: effectiveSessionName,

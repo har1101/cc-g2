@@ -682,6 +682,8 @@ ensure_infra() {
         CC_G2_VOICE_ENTRY_LAST_SESSION_FILE="$VOICE_ENTRY_LAST_SESSION_FILE" \
         CC_G2_REPO_ROOTS="$VOICE_ENTRY_REPO_ROOTS" \
         CC_G2_REPO_SCAN_DEPTH="$VOICE_ENTRY_SCAN_DEPTH" \
+        HUB_URL="http://127.0.0.1:${HUB_PORT}" \
+        HUB_AUTH_TOKEN="$HUB_AUTH_TOKEN" \
         node server/voice-entry/index.mjs \
         >> "$voice_log" 2>&1 &
 
