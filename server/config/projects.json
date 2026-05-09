@@ -1,0 +1,11 @@
+{
+  "projects": [
+    {
+      "project_id": "_unmanaged",
+      "label": "Unmanaged",
+      "path": "",
+      "default_backend": "claude-code",
+      "start_template": "claude"
+    }
+  ]
+}
