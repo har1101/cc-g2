@@ -1,58 +1,24 @@
+// notification-hub entry point. Owns:
+//   - service wiring (cfg-bound wrappers around the layered services)
+//   - the request dispatcher (router-style array of route handlers)
+//   - HTTP server lifecycle + graceful shutdown
+// Real work lives in routes/* → services/* → state/*, transport/*, core/*.
 import { createServer } from 'node:http'
-import { randomUUID } from 'node:crypto'
-import { readFile } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
-import path from 'node:path'
-import {
-  deriveSessionLabel,
-  getString,
-  normalizeMoshiPayload,
-  persistedApproval,
-  persistedNotification,
-  readRequestBody,
-  safeJsonParse,
-} from './notification-utils.mjs'
-import { transcribeAudioWithGroq } from './stt.mjs'
 import { log } from './core/log.mjs'
+import { config, resolveBindHosts } from './core/config.mjs'
 import {
   applyCors,
   isBodyTooLargeError,
   parseUrl,
   sendJson,
   sendRequestBodyTooLarge,
-  sendText,
 } from './core/http.mjs'
-import {
-  UI_SESSION,
-  createUiSession,
-  hasValidUiSession,
-  isPublicApiRequest,
-  requireApiAuth as coreRequireApiAuth,
-} from './core/auth.mjs'
-import {
-  approvals,
-  approvalsById,
-  approvalsByNotificationId,
-  contextStatusBySession,
-  getLastLocation,
-  notificationExternalIds,
-  notifications,
-  notificationsById,
-  permissionThreadSeenAt,
-  replies,
-  setLastLocation,
-} from './state/store.mjs'
-import {
-  appendJsonl,
-  bootstrap as persistenceBootstrap,
-  buildPaths,
-} from './state/persistence.mjs'
+import { isPublicApiRequest, requireApiAuth as coreRequireApiAuth } from './core/auth.mjs'
+import { bootstrap as persistenceBootstrap, buildPaths } from './state/persistence.mjs'
 import {
   addNotification as notificationServiceAdd,
   forwardReplyIfConfigured,
-  getReplyStatus,
-  listNotifications,
-  persistReply,
 } from './services/notification-service.mjs'
 import {
   cleanupApprovalsOnStop as approvalServiceCleanupOnStop,
@@ -60,361 +26,115 @@ import {
   markApprovalCleanup as approvalServiceMarkCleanup,
   resolveApproval as approvalServiceResolve,
 } from './services/approval-service.mjs'
-import { processCommand as commandServiceProcess } from './services/command-service.mjs'
 import { createTmuxRelay } from './transport/tmux-relay.mjs'
+import * as healthRoute from './routes/health.mjs'
+import * as authRoute from './routes/auth.mjs'
+import * as hooksRoute from './routes/hooks.mjs'
+import * as notificationsRoute from './routes/notifications.mjs'
+import * as approvalsRoute from './routes/approvals.mjs'
+import * as sttRoute from './routes/stt.mjs'
+import * as clientEventsRoute from './routes/client-events.mjs'
+import * as locationRoute from './routes/location.mjs'
+import * as contextStatusRoute from './routes/context-status.mjs'
+import * as commandRoute from './routes/command.mjs'
+import * as uiRoute from './routes/ui.mjs'
 
-const legacyHubBind = process.env.HUB_BIND
-const bindModeRaw = process.env.HUB_BIND_MODE
-let bindMode = bindModeRaw || 'tailnet'
-if (!['tailnet', 'localhost', 'any'].includes(bindMode)) {
-  console.warn(`[hub] unknown HUB_BIND_MODE="${bindMode}" — falling back to "tailnet"`)
-  bindMode = 'tailnet'
-}
-const tailscaleIp = String(process.env.HUB_TAILSCALE_IP || '').trim()
+const { notificationsFile, repliesFile, clientEventsFile, approvalsFile } = buildPaths({
+  dataDir: config.dataDir,
+})
 
-// Internal hook scripts hard-code http://127.0.0.1:8787, so 'tailnet' must keep
-// loopback reachable while phones reach us via the Tailscale IP. See design §7.1.
-function resolveBindHosts() {
-  if (!bindModeRaw && legacyHubBind) {
-    console.warn('[hub] HUB_BIND is deprecated — set HUB_BIND_MODE (tailnet|localhost|any) instead')
-    return [legacyHubBind]
-  }
-  if (bindMode === 'localhost') return ['127.0.0.1']
-  if (bindMode === 'any') return ['0.0.0.0']
-  const hosts = ['127.0.0.1']
-  if (tailscaleIp) hosts.push(tailscaleIp)
-  else console.warn('[hub] HUB_TAILSCALE_IP not set — listening on loopback only')
-  return hosts
-}
-
-const port = Number(process.env.HUB_PORT || '8787')
-const dataDir = path.resolve(process.env.HUB_DATA_DIR || 'tmp/notification-hub')
-const hubAuthToken = String(process.env.HUB_AUTH_TOKEN || '').trim()
-const hubAllowedOrigins = new Set(
-  String(process.env.HUB_ALLOWED_ORIGINS || '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean),
-)
-const hubPersistRaw = ['1', 'true', 'yes', 'on'].includes(String(process.env.HUB_PERSIST_RAW || '').toLowerCase())
-const hubPersistToolInput = ['1', 'true', 'yes', 'on'].includes(String(process.env.HUB_PERSIST_TOOL_INPUT || '').toLowerCase())
-const groqApiKey = String(process.env.GROQ_API_KEY || '').trim()
-const groqModelDefault = String(process.env.GROQ_MODEL || 'whisper-large-v3').trim()
-const { notificationsFile, repliesFile, clientEventsFile, approvalsFile } = buildPaths({ dataDir })
-const hubReplyRelayCmd = String(process.env.HUB_REPLY_RELAY_CMD || '').trim()
-const hubReplyRelayTimeoutMs = Math.max(
-  1000,
-  Number.parseInt(process.env.HUB_REPLY_RELAY_TIMEOUT_MS || '15000', 10) || 15000,
-)
-// Phase 1 voice/text commands ride the same relay path; allowlist them by default.
-const hubReplyRelaySources = new Set(
-  String(process.env.HUB_REPLY_RELAY_SOURCES || 'g2,web,g2_voice,g2_text')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean),
-)
-const hubPermissionThreadDedupMs = Math.max(
-  0,
-  Number.parseInt(process.env.HUB_PERMISSION_THREAD_DEDUP_MS || '8000', 10) || 8000,
-)
-const hubMaxBodyBytes = Math.max(
-  1024,
-  Number.parseInt(process.env.HUB_MAX_BODY_BYTES || '1048576', 10) || 1048576,
-)
-const hubMaxSttBodyBytes = Math.max(
-  hubMaxBodyBytes,
-  Number.parseInt(process.env.HUB_MAX_STT_BODY_BYTES || '12582912', 10) || 12582912,
-)
-
-function requireApiAuth(req, res) {
-  return coreRequireApiAuth(req, res, hubAuthToken)
-}
+// --- service wiring ------------------------------------------------------
+const approvalCfg = () => ({
+  approvalsFile,
+  persistToolInput: config.hubPersistToolInput,
+})
 
 // Thin wrapper that injects hub-level config and applies the stop-hook
-// auto-cleanup side effect. The service itself stays free of approval-layer
-// knowledge; this glue keeps the DAG clean (route → notification-service,
-// route → approval-service) without splitting addNotification's call sites.
+// auto-cleanup side effect. Keeps notification-service free of approval-layer
+// knowledge while preserving the all-in-one addNotification call sites.
 async function addNotification(payload, logPrefix = 'notification') {
   const result = await notificationServiceAdd(payload, logPrefix, {
-    persistRaw: hubPersistRaw,
-    permissionThreadDedupMs: hubPermissionThreadDedupMs,
+    persistRaw: config.hubPersistRaw,
+    permissionThreadDedupMs: config.hubPermissionThreadDedupMs,
     notificationsFile,
   })
   if (result.duplicate) return result
 
   const item = result.item
-  const hookType =
-    item && item.metadata && typeof item.metadata.hookType === 'string'
-      ? item.metadata.hookType
-      : ''
-  // stop通知が来たら同セッションの全pending承認を自動解決
-  if (hookType === 'stop') {
-    const sessionId = item.metadata?.sessionId
-    if (sessionId) {
-      approvalServiceCleanupOnStop(
-        { sessionId, decidedAt: new Date().toISOString() },
-        approvalCfg(),
-      )
-    }
+  const hookType = item?.metadata?.hookType
+  if (hookType === 'stop' && item.metadata?.sessionId) {
+    approvalServiceCleanupOnStop(
+      { sessionId: item.metadata.sessionId, decidedAt: new Date().toISOString() },
+      approvalCfg(),
+    )
   }
   return result
 }
 
-function approvalCfg() {
-  return { approvalsFile, persistToolInput: hubPersistToolInput }
-}
-
-async function createApproval(params) {
-  return approvalServiceCreate(params, {
+const createApproval = (params) =>
+  approvalServiceCreate(params, {
     addNotification,
     approvalsFile,
-    persistToolInput: hubPersistToolInput,
+    persistToolInput: config.hubPersistToolInput,
   })
-}
 
-function resolveApproval(approvalId, decision, comment, decidedBy) {
-  return approvalServiceResolve(approvalId, decision, comment, decidedBy, approvalCfg())
-}
+const resolveApproval = (id, decision, comment, by) =>
+  approvalServiceResolve(id, decision, comment, by, approvalCfg())
 
-function markApprovalCleanup(record, resolution, decidedBy, decidedAt) {
-  return approvalServiceMarkCleanup(record, resolution, decidedBy, decidedAt, approvalCfg())
-}
+const markApprovalCleanup = (record, resolution, by, at) =>
+  approvalServiceMarkCleanup(record, resolution, by, at, approvalCfg())
 
 const relayReplyIfConfigured = createTmuxRelay({
-  cmd: hubReplyRelayCmd,
-  timeoutMs: hubReplyRelayTimeoutMs,
-  allowedSources: hubReplyRelaySources,
+  cmd: config.hubReplyRelayCmd,
+  timeoutMs: config.hubReplyRelayTimeoutMs,
+  allowedSources: config.hubReplyRelaySources,
 })
 
-function matchApprovalPath(pathname) {
-  const m = pathname.match(/^\/api\/approvals\/([^/]+)$/)
-  return m ? decodeURIComponent(m[1]) : null
-}
-function matchApprovalDecidePath(pathname) {
-  const m = pathname.match(/^\/api\/approvals\/([^/]+)\/decide$/)
-  return m ? decodeURIComponent(m[1]) : null
-}
-
-async function bootstrap() {
-  await persistenceBootstrap({ dataDir, notificationsFile, repliesFile, approvalsFile })
-}
-
-function matchNotificationDetail(pathname) {
-  const m = pathname.match(/^\/api\/notifications\/([^/]+)$/)
-  return m ? decodeURIComponent(m[1]) : null
-}
-
-function matchNotificationReply(pathname) {
-  const m = pathname.match(/^\/api\/notifications\/([^/]+)\/reply$/)
-  return m ? decodeURIComponent(m[1]) : null
-}
-
-const HOOK_POLL_TIMEOUT_MS = 600_000
-const HOOK_POLL_INTERVAL_MS = 2_000
-
-function buildToolPreview(toolName, toolInput) {
-  if (toolName === 'Bash') {
-    return toolInput?.command || ''
-  } else if (toolName === 'apply_patch') {
-    return buildApplyPatchPreview(toolInput)
-  } else if (toolName === 'Edit') {
-    const file = toolInput?.file_path || ''
-    const old = (toolInput?.old_string || '').slice(0, 2000)
-    const new_ = (toolInput?.new_string || '').slice(0, 2000)
-    return `${file}\n--- old ---\n${old}\n+++ new +++\n${new_}`
-  } else if (toolName === 'Write') {
-    const file = toolInput?.file_path || ''
-    const content = (toolInput?.content || '').slice(0, 2000)
-    return `${file}\n${content}`
-  } else {
-    return JSON.stringify(toolInput || {}).slice(0, 2000)
-  }
-}
-
-function buildApplyPatchPreview(toolInput) {
-  const patch = getApplyPatchRawString(toolInput)
-  if (patch === null) return JSON.stringify(toolInput || {}).slice(0, 2000)
-
-  const fileLines = []
-  const seen = new Set()
-  for (const line of patch.split(/\r?\n/)) {
-    const match = line.match(/^\*\*\* (Add|Update|Delete) File: (.+)$/)
-    if (match) {
-      const label = match[1] === 'Add' ? 'add' : match[1] === 'Update' ? 'edit' : 'delete'
-      const key = `${label}:${match[2]}`
-      if (!seen.has(key)) {
-        seen.add(key)
-        fileLines.push(`- ${label} ${match[2]}`)
-      }
-    }
-  }
-
-  const patchLines = patch
-    .replace(/\r\n/g, '\n')
-    .split('\n')
-    .slice(0, 80)
-    .map((line) => (line.length > 160 ? `${line.slice(0, 159)}…` : line))
-    .join('\n')
-
-  const summary = fileLines.length > 0
-    ? ['Files:', ...fileLines.slice(0, 12), ''].join('\n')
-    : ''
-  const truncated = patch.split(/\r?\n/).length > 80 ? '\n…' : ''
-  return `${summary}${patchLines}${truncated}`.slice(0, 4000)
-}
-
-function getApplyPatchRawString(toolInput) {
-  for (const key of ['command', 'input', 'patch']) {
-    const value = toolInput?.[key]
-    if (typeof value === 'string' && value.length > 0) return value
-  }
-  return null
-}
-
-function buildApprovalUiUrl() {
-  return `http://127.0.0.1:${port}/ui`
-}
-
+// macOS-only desktop heads-up. Routes that need it call deps.spawnLocalNotification.
 function spawnLocalNotification(toolName) {
   try {
-    const approvalUrl = buildApprovalUiUrl()
     const child = spawn('terminal-notifier', [
       '-title', 'Permission',
       '-message', `${toolName} approval pending`,
-      '-open', approvalUrl,
+      '-open', `http://127.0.0.1:${config.port}/ui`,
       '-sound', 'Glass',
     ], { timeout: 5000, stdio: 'ignore' })
     child.on('error', () => {}) // コマンド未導入時の ENOENT を無視
   } catch { /* ignore */ }
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
+// --- request dispatcher --------------------------------------------------
+const routeHandlers = [
+  healthRoute.handle,
+  authRoute.handle,
+  hooksRoute.handle,
+  sttRoute.handle,
+  clientEventsRoute.handle,
+  locationRoute.handle,
+  contextStatusRoute.handle,
+  commandRoute.handle,
+  approvalsRoute.handle,
+  notificationsRoute.handle,
+  uiRoute.handle,
+]
 
-async function handlePermissionRequestHook(req, res) {
-  let body
-  try {
-    body = await readRequestBody(req, { maxBytes: hubMaxBodyBytes })
-  } catch (err) {
-    if (isBodyTooLargeError(err)) {
-      return sendRequestBodyTooLarge(res, err)
-    }
-    throw err
-  }
-  const parsed = safeJsonParse(body || '{}')
-  if (!parsed.ok || !parsed.value || typeof parsed.value !== 'object') {
-    return sendJson(res, 400, { error: 'Invalid JSON body' })
-  }
-  const p = parsed.value
-  const tmuxTarget = req.headers['x-tmux-target'] || ''
-  const toolName = getString(p.tool_name)
-  const toolInput = p.tool_input || {}
-  const cwd = getString(p.cwd)
-  const sessionId = getString(p.session_id)
-  const agentSource = getString(req.headers['x-agent-source']) === 'codex' ? 'codex' : 'claude-code'
-  const approvalSource = agentSource === 'codex' ? 'codex-hook' : 'claude-code-hook'
-
-  const title = toolName
-  let preview = buildToolPreview(toolName, toolInput)
-
-  // AskUserQuestion: questions metadata を追加し、プレビューを整形
-  const isAskQ = toolName === 'AskUserQuestion' && Array.isArray(toolInput.questions)
-  const extraMeta = {}
-  if (isAskQ) {
-    const previewLines = []
-    for (const q of toolInput.questions) {
-      previewLines.push(q.question || '')
-      if (Array.isArray(q.options)) {
-        for (const opt of q.options) {
-          previewLines.push(`  • ${opt.label}: ${opt.description || ''}`)
-        }
-      }
-    }
-    preview = previewLines.join('\n')
-    extraMeta.hookType = 'ask-user-question'
-    extraMeta.questions = toolInput.questions
-  }
-
-  const projectSlug = path.basename(cwd || '').replace(/[^a-zA-Z0-9_-]/g, '_')
-  const sessionSlug = (sessionId || '').replace(/[^a-zA-Z0-9_-]/g, '_')
-  const threadId = `permission_${projectSlug}_${sessionSlug}_${Date.now()}`
-
-  const { approval } = await createApproval({
-    source: approvalSource,
-    toolName,
-    toolInput,
-    toolId: '',
-    cwd,
-    agentName: agentSource,
-    title,
-    body: preview,
-    threadId,
-    metadata: {
-      ...extraMeta,
-      tmuxTarget,
-      sessionLabel: deriveSessionLabel(tmuxTarget),
-      sessionId,
-      agentName: agentSource,
-    },
-  })
-
-  spawnLocalNotification(toolName)
-
-  // PC側で承認/拒否された場合、Claude Codeが接続を切る → 検知してマーク
-  let clientDisconnected = false
-  const onClose = () => { clientDisconnected = true }
-  req.on('close', onClose)
-  res.on('close', onClose)
-
-  const deadline = Date.now() + HOOK_POLL_TIMEOUT_MS
-  while (Date.now() < deadline) {
-    await sleep(HOOK_POLL_INTERVAL_MS)
-    if (clientDisconnected) {
-      const record = approvalsById.get(approval.id)
-      if (record && record.status === 'pending') {
-        markApprovalCleanup(record, 'terminal-disconnect', 'terminal')
-        log(`approval cleaned up by terminal disconnect id=${record.id}`)
-      }
-      req.off('close', onClose)
-      res.off('close', onClose)
-      return
-    }
-    const record = approvalsById.get(approval.id)
-    if (record && record.status === 'decided') {
-      record.deliveredAt = new Date().toISOString()
-      req.off('close', onClose)
-      res.off('close', onClose)
-      if (record.decision === 'approve') {
-        return sendJson(res, 200, {
-          hookSpecificOutput: {
-            hookEventName: 'PermissionRequest',
-            decision: { behavior: 'allow' },
-          },
-        })
-      }
-      if (record.decision === 'deny') {
-        const message = record.comment
-          ? `G2: ${record.comment}`
-          : 'G2から拒否されました'
-        return sendJson(res, 200, {
-          hookSpecificOutput: {
-            hookEventName: 'PermissionRequest',
-            decision: { behavior: 'deny', message },
-          },
-        })
-      }
-      log(
-        `approval cleanup observed while waiting id=${record.id} resolution=${record.resolution || 'unknown'}`,
-      )
-      return sendJson(res, 200, {})
-    }
-  }
-
-  // Timeout: return empty response → Claude Code shows normal dialog
-  req.off('close', onClose)
-  res.off('close', onClose)
-  sendJson(res, 200, {})
+const deps = {
+  hubAuthToken: config.hubAuthToken,
+  hubMaxBodyBytes: config.hubMaxBodyBytes,
+  hubMaxSttBodyBytes: config.hubMaxSttBodyBytes,
+  hubPersistRaw: config.hubPersistRaw,
+  groqApiKey: config.groqApiKey,
+  groqModelDefault: config.groqModelDefault,
+  notificationsFile,
+  repliesFile,
+  clientEventsFile,
+  addNotification,
+  createApproval,
+  resolveApproval,
+  markApprovalCleanup,
+  forwardReplyIfConfigured,
+  relayReplyIfConfigured,
+  spawnLocalNotification,
 }
 
 const handler = async (req, res) => {
@@ -422,610 +142,23 @@ const handler = async (req, res) => {
   const url = parseUrl(req)
   const pathname = url.pathname
 
-  if (!applyCors(req, res, hubAllowedOrigins)) {
+  if (!applyCors(req, res, config.hubAllowedOrigins)) {
     return sendJson(res, 403, { ok: false, error: 'Origin not allowed' })
   }
-
   if (method === 'OPTIONS') {
     res.statusCode = 204
     return res.end()
   }
-
   if (pathname.startsWith('/api/') && !isPublicApiRequest(method, pathname)) {
-    if (!requireApiAuth(req, res)) return
+    if (!coreRequireApiAuth(req, res, config.hubAuthToken)) return
   }
 
+  const ctx = { method, pathname, url, deps }
   try {
-
-  if (method === 'GET' && pathname === '/api/health') {
-    return sendJson(res, 200, {
-      ok: true,
-      service: 'notification-hub',
-      notifications: notifications.length,
-      replies: replies.length,
-      approvals: approvals.length,
-      pendingApprovals: approvals.filter((a) => a.status === 'pending').length,
-      now: new Date().toISOString(),
-    })
-  }
-
-  if (method === 'GET' && pathname === '/api/auth-check') {
-    if (!requireApiAuth(req, res)) return
-    return sendJson(res, 200, { ok: true })
-  }
-
-  if (method === 'POST' && pathname === '/api/hooks/permission-request') {
-    return handlePermissionRequestHook(req, res)
-  }
-
-
-  if (method === 'POST' && pathname === '/api/notify/moshi') {
-    const rawBody = await readRequestBody(req, { maxBytes: hubMaxBodyBytes })
-    const ctype = req.headers['content-type'] || ''
-    let payload = null
-
-    if (ctype.includes('application/json')) {
-      const parsed = safeJsonParse(rawBody || '{}')
-      if (!parsed.ok) {
-        return sendJson(res, 400, { ok: false, error: `Invalid JSON: ${parsed.error}` })
-      }
-      payload = parsed.value
-    } else if (ctype.includes('application/x-www-form-urlencoded')) {
-      const form = new URLSearchParams(rawBody)
-      payload = Object.fromEntries(form.entries())
-    } else {
-      const parsed = safeJsonParse(rawBody)
-      payload = parsed.ok ? parsed.value : { rawBody }
+    for (const route of routeHandlers) {
+      if (await route(req, res, ctx)) return
     }
-
-    // MOSHI の permission-request 通知は HTTP hook が既に notification + approval を
-    // 作成済みのため、notifications 配列には保存しない（G2 重複防止）。
-    const preItem = normalizeMoshiPayload(payload, {
-      persistRaw: hubPersistRaw,
-      createId: () => randomUUID(),
-    })
-    if (preItem.metadata && preItem.metadata.hookType === 'permission-request') {
-      log(`moshi permission-request notification: skipped (not stored) title=${JSON.stringify(preItem.title)}`)
-      return sendJson(res, 201, { ok: true, item: preItem, stored: false })
-    }
-
-    const { item } = await addNotification(payload, 'moshi notification')
-    return sendJson(res, 201, { ok: true, item })
-  }
-
-  if (method === 'POST' && pathname === '/api/client-events') {
-    const rawBody = await readRequestBody(req, { maxBytes: hubMaxBodyBytes })
-    const parsed = safeJsonParse(rawBody || '{}')
-    if (!parsed.ok || !parsed.value || typeof parsed.value !== 'object') {
-      return sendJson(res, 400, { ok: false, error: 'Invalid JSON body' })
-    }
-    const p = parsed.value
-    const line = {
-      id: randomUUID(),
-      createdAt: new Date().toISOString(),
-      source: getString(p.source, 'web-client'),
-      message: getString(p.message),
-      level: getString(p.level, 'info'),
-      context: typeof p.context === 'object' && p.context !== null ? p.context : undefined,
-    }
-    await appendJsonl(clientEventsFile, line)
-    return sendJson(res, 201, { ok: true })
-  }
-
-  // --- 位置情報 (Overland / 汎用 GPS ロガー対応) ---
-
-  if (method === 'POST' && pathname === '/api/location') {
-    const rawBody = await readRequestBody(req, { maxBytes: hubMaxBodyBytes })
-    const parsed = safeJsonParse(rawBody || '{}')
-    if (!parsed.ok || !parsed.value || typeof parsed.value !== 'object') {
-      return sendJson(res, 400, { ok: false, error: 'Invalid JSON body' })
-    }
-    const p = parsed.value
-    // Overland GeoJSON format: { locations: [{ geometry: { coordinates: [lng, lat] }, properties: { timestamp, ... } }] }
-    const locations = Array.isArray(p.locations) ? p.locations : []
-    if (locations.length > 0) {
-      const latest = locations[locations.length - 1]
-      const coords = latest?.geometry?.coordinates
-      if (!Array.isArray(coords) || coords.length < 2) {
-        return sendJson(res, 400, { ok: false, error: 'Invalid coordinates array' })
-      }
-      const lat = Number(coords[1])
-      const lng = Number(coords[0])
-      if (!Number.isFinite(lat) || !Number.isFinite(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
-        return sendJson(res, 400, { ok: false, error: 'Invalid latitude/longitude values' })
-      }
-      const alt = coords.length >= 3 ? Number(coords[2]) : NaN
-      const props = latest.properties && typeof latest.properties === 'object' ? latest.properties : {}
-      const spd = Number(props.speed)
-      const bat = Number(props.battery_level)
-      const updated = {
-        lat,
-        lng,
-        altitude: Number.isFinite(alt) ? alt : null,
-        timestamp: String(props.timestamp || '') || new Date().toISOString(),
-        speed: Number.isFinite(spd) ? spd : null,
-        battery: Number.isFinite(bat) ? bat : null,
-        receivedAt: new Date().toISOString(),
-      }
-      setLastLocation(updated)
-      log(`location updated: lat=${updated.lat} lng=${updated.lng}`)
-    }
-    return sendJson(res, 200, { ok: true })
-  }
-
-  if (method === 'GET' && pathname === '/api/location') {
-    const loc = getLastLocation()
-    if (!loc) {
-      return sendJson(res, 200, { ok: true, location: null, message: 'No location data received yet' })
-    }
-    return sendJson(res, 200, { ok: true, location: loc })
-  }
-
-  if (method === 'POST' && pathname === '/api/stt/transcriptions') {
-    const rawBody = await readRequestBody(req, { maxBytes: hubMaxSttBodyBytes })
-    const parsed = safeJsonParse(rawBody || '{}')
-    if (!parsed.ok || !parsed.value || typeof parsed.value !== 'object') {
-      return sendJson(res, 400, { ok: false, error: 'Invalid JSON body' })
-    }
-    const p = parsed.value
-    const audioBase64 = getString(p.audioBase64)
-    if (!audioBase64) {
-      return sendJson(res, 400, { ok: false, error: '`audioBase64` is required' })
-    }
-    const result = await transcribeAudioWithGroq(
-      {
-        audioBase64,
-        mimeType: getString(p.mimeType),
-        model: getString(p.model),
-        language: getString(p.language),
-        responseFormat: getString(p.response_format),
-      },
-      {
-        apiKey: groqApiKey,
-        defaultModel: groqModelDefault,
-      },
-    )
-    if (!result.ok) {
-      return sendJson(res, result.status, { ok: false, error: result.error })
-    }
-    return sendJson(res, 200, result.payload)
-  }
-
-  // Context status: StatusLine hook からコンテキストウィンドウ占有率を受信
-  if (method === 'POST' && pathname === '/api/context-status') {
-    const rawBody = await readRequestBody(req, { maxBytes: hubMaxBodyBytes })
-    const parsed = safeJsonParse(rawBody || '{}')
-    if (!parsed.ok || !parsed.value || typeof parsed.value !== 'object') {
-      return sendJson(res, 400, { ok: false, error: 'Invalid JSON body' })
-    }
-    const p = parsed.value
-    const sessionId = getString(p.sessionId, 'default')
-    contextStatusBySession.set(sessionId, {
-      sessionId,
-      cwd: getString(p.cwd),
-      usedPercentage: typeof p.usedPercentage === 'number' ? p.usedPercentage : 0,
-      model: getString(p.model),
-      updatedAt: new Date().toISOString(),
-    })
-    return sendJson(res, 200, { ok: true })
-  }
-
-  if (method === 'GET' && pathname === '/api/context-status') {
-    return sendJson(res, 200, { ok: true, sessions: [...contextStatusBySession.values()] })
-  }
-
-  if (method === 'GET' && pathname === '/api/notifications') {
-    const limitRaw = Number(url.searchParams.get('limit') || '20')
-    const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(Math.floor(limitRaw), 1), 100) : 20
-    return sendJson(res, 200, { ok: true, items: listNotifications(limit) })
-  }
-
-  if (method === 'GET') {
-    const id = matchNotificationDetail(pathname)
-    if (id) {
-      const item = notificationsById.get(id)
-      if (!item) return sendJson(res, 404, { ok: false, error: 'Notification not found' })
-      return sendJson(res, 200, { ok: true, item })
-    }
-  }
-
-  if (method === 'POST') {
-    const id = matchNotificationReply(pathname)
-    if (id) {
-      const item = notificationsById.get(id)
-      if (!item) return sendJson(res, 404, { ok: false, error: 'Notification not found' })
-      const rawBody = await readRequestBody(req, { maxBytes: hubMaxBodyBytes })
-      const parsed = safeJsonParse(rawBody || '{}')
-      if (!parsed.ok || !parsed.value || typeof parsed.value !== 'object') {
-        return sendJson(res, 400, { ok: false, error: 'Invalid JSON body' })
-      }
-      const replyTextRaw = getString(parsed.value.replyText)
-      const action = getString(parsed.value.action)
-      const comment = getString(parsed.value.comment)
-      const source = getString(parsed.value.source)
-
-      // answerData バリデーション: plain object, キー/値とも string, 上限付き
-      let answerData = undefined
-      if (parsed.value.answerData && typeof parsed.value.answerData === 'object' && !Array.isArray(parsed.value.answerData)) {
-        const entries = Object.entries(parsed.value.answerData)
-        if (entries.length <= 10 && entries.every(([k, v]) => typeof k === 'string' && typeof v === 'string' && k.length <= 2000 && v.length <= 2000)) {
-          answerData = parsed.value.answerData
-        }
-      }
-
-      const validActions = new Set(['approve', 'deny', 'comment', 'answer'])
-      if (action && !validActions.has(action)) {
-        return sendJson(res, 400, { ok: false, error: 'Invalid `action`' })
-      }
-      if (action === 'answer') {
-        if (!answerData) {
-          return sendJson(res, 400, { ok: false, error: '`answerData` is required for action=answer' })
-        }
-        const isAskQ = item.metadata && item.metadata.hookType === 'ask-user-question'
-        if (!isAskQ) {
-          return sendJson(res, 400, { ok: false, error: 'action=answer is only valid for ask-user-question notifications' })
-        }
-      }
-
-      const replyText =
-        replyTextRaw ||
-        (action === 'approve' ? '[ACTION] approve' : '') ||
-        (action === 'deny' ? '[ACTION] deny' : '') ||
-        (action === 'answer' ? '[ACTION] answer' : '') ||
-        (action === 'comment' ? comment : '') ||
-        ''
-      if (!replyText) {
-        return sendJson(res, 400, {
-          ok: false,
-          error: '`replyText` or (`action` + optional `comment`) is required',
-        })
-      }
-
-      /** @type {ReplyRecord} */
-      const record = {
-        id: randomUUID(),
-        notificationId: id,
-        replyText,
-        createdAt: new Date().toISOString(),
-        status: 'stubbed',
-        action: action ? /** @type {'approve'|'deny'|'comment'} */ (action) : undefined,
-        resolvedAction: undefined,
-        result: undefined,
-        ignoredReason: undefined,
-        comment: comment || undefined,
-        source: source || undefined,
-      }
-      let linkedApproval = approvalsByNotificationId.get(id)
-      const isAskUserQuestion = item.metadata && item.metadata.hookType === 'ask-user-question'
-      const isApprovalNotification =
-        isAskUserQuestion ||
-        (item.metadata && item.metadata.hookType === 'permission-request') ||
-        (item.metadata && item.metadata.approvalId)
-      let shouldRelay = true
-      // Fallback: if no direct link but notification looks like an approval,
-      // find a matching pending approval by content similarity.
-      // MOSHI notifications don't carry approvalId, so we match by toolName
-      // and file path / command to avoid resolving the wrong approval.
-      if (!linkedApproval && isApprovalNotification) {
-        const replyToolName = (item.metadata && item.metadata.toolName) || ''
-        const replyTitle = item.title || ''
-        const replySummary = item.summary || ''
-        const replyFullText = item.fullText || ''
-
-        let bestMatch = null
-        for (let i = approvals.length - 1; i >= 0; i--) {
-          if (approvals[i].status !== 'pending') continue
-
-          // Same toolName is required for a match
-          if (replyToolName && approvals[i].toolName !== replyToolName) continue
-
-          // Try to match by file path or command content
-          const approvalNotif = notificationsById.get(approvals[i].notificationId)
-          if (approvalNotif && replyToolName) {
-            const approvalText = (approvalNotif.summary || '') + ' ' + (approvalNotif.fullText || '')
-            const input = approvals[i].toolInput || {}
-            const filePath = input.file_path || ''
-            const command = input.command || ''
-            const identifier = filePath || command
-
-            // Check if the reply notification mentions the same file/command
-            if (identifier) {
-              const shortId = identifier.split('/').pop() || identifier.slice(0, 30)
-              if (replyTitle.includes(shortId) || replySummary.includes(shortId) || replyFullText.includes(shortId)) {
-                bestMatch = approvals[i]
-                break
-              }
-            }
-          }
-
-          // If no content match found yet, keep as fallback (most recent pending with same toolName)
-          if (!bestMatch) {
-            bestMatch = approvals[i]
-          }
-        }
-
-        linkedApproval = bestMatch
-        if (linkedApproval) {
-          const matchType = replyToolName ? 'content' : 'most-recent'
-          log(`approval-broker fallback: matched reply to approval id=${linkedApproval.id} (${matchType} match, no direct link)`)
-        }
-      }
-      if (linkedApproval && linkedApproval.status === 'pending') {
-        // AskUserQuestion の回答: deny+コメントとして返す（PermissionRequest経由でClaude Codeに届く）
-        if (action === 'answer' && answerData && isAskUserQuestion) {
-          linkedApproval.answerData = answerData
-          const answerPairs = Object.entries(answerData).map(([q, a]) => `${q} → ${a}`)
-          const answerComment = `選択回答: ${answerPairs.join(' / ')}`
-          record.resolvedAction = 'deny'
-          record.result = 'resolved'
-          resolveApproval(linkedApproval.id, 'deny', answerComment, source || 'g2')
-          log(`ask-user-question answered id=${linkedApproval.id} answers=${JSON.stringify(answerData)}`)
-          shouldRelay = false
-        }
-        // Resolve approval: explicit approve/deny actions, or parse comment text
-        let resolvedAction = null
-        if (action === 'answer') {
-          // already handled above
-        } else if (action === 'approve' || action === 'deny') {
-          resolvedAction = action
-        } else if (action === 'comment' || !action) {
-          // G2 sends comments (not explicit approve/deny buttons).
-          // Parse comment text for intent keywords. If no keyword matches,
-          // do NOT resolve the approval — let the comment be relayed as plain text
-          // to the Claude Code input. Explicit approve/deny buttons should be used
-          // for approval decisions.
-          const text = (comment || replyText || '').toLowerCase().trim()
-          const denyPatterns = ['拒否', 'deny', 'no', 'reject', 'だめ', 'ダメ', 'いいえ']
-          const approvePatterns = ['承認', 'approve', 'yes', 'ok', 'おk', 'いいよ', 'はい', '許可']
-          if (denyPatterns.some((p) => text.includes(p))) {
-            resolvedAction = 'deny'
-          } else if (approvePatterns.some((p) => text.includes(p))) {
-            resolvedAction = 'approve'
-          }
-          // else: no keyword match → resolvedAction stays null → approval not resolved
-          // comment is still relayed to tmux as plain text input
-        }
-        if (resolvedAction) {
-          record.resolvedAction = resolvedAction
-          record.result = 'resolved'
-          resolveApproval(linkedApproval.id, resolvedAction, comment, source || 'g2')
-          log(
-            `approval-broker resolved id=${linkedApproval.id} action=${resolvedAction} (original=${action || 'none'} text=${(comment || replyText || '').slice(0, 50)})`,
-          )
-          // HTTP hook が承認を解決済みなので tmux relay は不要。
-          // relay すると承認ダイアログ消失後に y/n キーが入力欄に漏れる。
-          shouldRelay = false
-        } else if (action === 'comment') {
-          // Comment without keyword match on an approval notification:
-          // HTTP hook 経由の場合は deny + comment として approval を解決し、
-          // HTTP レスポンスで Claude Code に返す。tmux relay は不要。
-          const commentText = comment || replyText || ''
-          record.resolvedAction = 'deny'
-          record.result = 'resolved'
-          resolveApproval(linkedApproval.id, 'deny', commentText, source || 'g2')
-          log(
-            `approval-broker resolved as deny+comment id=${linkedApproval.id} text=${commentText.slice(0, 50)}`,
-          )
-          shouldRelay = false
-        }
-      } else if (isApprovalNotification) {
-        // Stale/ambiguous approval replies must not be relayed to tmux.
-        // Otherwise an old "approve" tap can affect a newer pending prompt.
-        shouldRelay = false
-        record.result = 'ignored'
-        if (linkedApproval) {
-          record.ignoredReason = 'approval-not-pending'
-          record.error = 'Approval is no longer pending'
-          log(
-            `reply relay skipped: approval already decided id=${linkedApproval.id} action=${action || 'none'}`,
-          )
-        } else {
-          record.ignoredReason = 'approval-link-not-found'
-          record.error = 'Approval link not found'
-          log(`reply relay skipped: approval link not found notificationId=${id} action=${action || 'none'}`)
-        }
-      }
-
-      if (!record.result) {
-        record.result = 'relayed'
-      }
-
-      const fwd = await forwardReplyIfConfigured({
-        reply: record,
-        notification: {
-          id: item.id,
-          title: item.title,
-          summary: item.summary,
-          metadata: item.metadata,
-        },
-      })
-      const relay = shouldRelay
-        ? await relayReplyIfConfigured({
-            reply: record,
-            notification: {
-              id: item.id,
-              title: item.title,
-              summary: item.summary,
-              metadata: item.metadata,
-            },
-          })
-        : { status: 'stubbed' }
-      const statuses = [fwd.status, relay.status]
-      if (statuses.includes('failed')) record.status = 'failed'
-      else if (statuses.includes('forwarded')) record.status = 'forwarded'
-      else record.status = 'stubbed'
-      const errors = [fwd.error, relay.error].filter(Boolean)
-      if (errors.length > 0) record.error = [record.error, ...errors].filter(Boolean).join(' | ')
-      replies.push(record)
-      await appendJsonl(repliesFile, record)
-
-      log(
-        `reply accepted id=${record.id} notificationId=${record.notificationId} status=${record.status}${record.action ? ` action=${record.action}` : ''}${record.error ? ` error=${record.error}` : ''}`,
-      )
-      return sendJson(res, 200, { ok: true, reply: record })
-    }
-  }
-
-  if (method === 'POST' && pathname === '/api/approvals') {
-    const rawBody = await readRequestBody(req, { maxBytes: hubMaxBodyBytes })
-    const parsed = safeJsonParse(rawBody || '{}')
-    if (!parsed.ok || !parsed.value || typeof parsed.value !== 'object') {
-      return sendJson(res, 400, { ok: false, error: 'Invalid JSON body' })
-    }
-    const p = parsed.value
-    const toolName = getString(p.toolName)
-    if (!toolName) {
-      return sendJson(res, 400, { ok: false, error: '`toolName` is required' })
-    }
-    const { approval, notification } = await createApproval({
-      source: getString(p.source),
-      toolName,
-      toolInput: p.toolInput ?? null,
-      toolId: getString(p.toolId),
-      cwd: getString(p.cwd),
-      reason: getString(p.reason),
-      agentName: getString(p.agentName),
-      title: getString(p.title),
-      body: getString(p.body),
-      metadata: typeof p.metadata === 'object' && p.metadata !== null ? p.metadata : {},
-      threadId: getString(p.threadId),
-    })
-    return sendJson(res, 201, {
-      ok: true,
-      approvalId: approval.id,
-      approval,
-      notificationId: notification.id,
-    })
-  }
-
-  if (method === 'GET') {
-    const approvalId = matchApprovalPath(pathname)
-    if (approvalId) {
-      const record = approvalsById.get(approvalId)
-      if (!record) return sendJson(res, 404, { ok: false, error: 'Approval not found' })
-      return sendJson(res, 200, { ok: true, approval: record })
-    }
-  }
-
-  if (method === 'POST') {
-    const approvalId = matchApprovalDecidePath(pathname)
-    if (approvalId) {
-      const record = approvalsById.get(approvalId)
-      if (!record) return sendJson(res, 404, { ok: false, error: 'Approval not found' })
-      if (record.status !== 'pending') {
-        return sendJson(res, 409, { ok: false, error: 'Approval already decided', approval: record })
-      }
-      const rawBody = await readRequestBody(req, { maxBytes: hubMaxBodyBytes })
-      const parsed = safeJsonParse(rawBody || '{}')
-      if (!parsed.ok || !parsed.value || typeof parsed.value !== 'object') {
-        return sendJson(res, 400, { ok: false, error: 'Invalid JSON body' })
-      }
-      const decision = getString(parsed.value.decision)
-      if (decision !== 'approve' && decision !== 'deny') {
-        return sendJson(res, 400, { ok: false, error: '`decision` must be "approve" or "deny"' })
-      }
-      const comment = getString(parsed.value.comment)
-      const source = getString(parsed.value.source)
-      const updated = resolveApproval(approvalId, decision, comment, source)
-      return sendJson(res, 200, { ok: true, approval: updated })
-    }
-  }
-
-  if (method === 'GET' && pathname === '/api/approvals') {
-    const pending = approvals.filter((a) => a.status === 'pending')
-    return sendJson(res, 200, { ok: true, items: pending })
-  }
-
-  if (method === 'GET' && (pathname === '/ui' || pathname === '/ui/')) {
-    if (hubAuthToken) {
-      const validSession = hasValidUiSession(req)
-      const queryToken = getString(url.searchParams.get('token'))
-      if (!validSession) {
-        if (queryToken !== hubAuthToken) {
-          return sendText(
-            res,
-            401,
-            'Unauthorized. Open /ui?token=<HUB_AUTH_TOKEN> once to create a browser session.',
-          )
-        }
-        const session = createUiSession()
-        res.statusCode = 302
-        res.setHeader(
-          'Set-Cookie',
-          `${UI_SESSION.cookie}=${session}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${UI_SESSION.maxAgeSec}`,
-        )
-        res.setHeader('Location', '/ui')
-        return res.end()
-      }
-    }
-    const uiPath = new URL('./approval-ui.html', import.meta.url)
-    const html = await readFile(uiPath, 'utf8')
-    res.statusCode = 200
-    res.setHeader('Content-Type', 'text/html; charset=utf-8')
-    res.end(html)
-    return
-  }
-
-  if (method === 'POST' && pathname === '/api/v1/command') {
-    let rawBody
-    try {
-      rawBody = await readRequestBody(req, { maxBytes: hubMaxBodyBytes })
-    } catch (err) {
-      if (isBodyTooLargeError(err)) return sendRequestBodyTooLarge(res, err)
-      throw err
-    }
-    const parsed = safeJsonParse(rawBody || '{}')
-    if (!parsed.ok || !parsed.value || typeof parsed.value !== 'object') {
-      return sendJson(res, 400, { ok: false, error: 'invalid JSON body' })
-    }
-    const p = parsed.value
-    const result = await commandServiceProcess(
-      {
-        source: p.source,
-        text: p.text,
-        transcriptConfidence: p.transcript_confidence,
-        tmuxTarget: p.tmux_target,
-      },
-      {
-        relay: relayReplyIfConfigured,
-        notificationsFile,
-        repliesFile,
-        persistRaw: hubPersistRaw,
-      },
-    )
-    return sendJson(res, result.status, result.body)
-  }
-
-  if (method === 'GET' && pathname === '/') {
-    return sendText(
-      res,
-      200,
-      [
-        'notification-hub (approval-broker)',
-        '',
-        'GET  /api/health',
-        'POST /api/hooks/permission-request  (HTTP hook for Claude Code)',
-        'POST /api/notify/moshi',
-        'GET  /api/notifications?limit=20',
-        'GET  /api/notifications/:id',
-        'POST /api/notifications/:id/reply',
-        '',
-        'POST /api/approvals              (create approval request)',
-        'GET  /api/approvals              (list pending approvals)',
-        'GET  /api/approvals/:id          (poll approval status)',
-        'POST /api/approvals/:id/decide   (submit decision)',
-        '',
-        'POST /api/v1/command             (free-text command from G2)',
-        '',
-        'GET  /ui                         (approval dashboard)',
-        'POST /api/client-events          (frontend event log intake)',
-        'POST /api/location               (receive GPS from Overland/etc)',
-        'GET  /api/location               (get latest GPS location)',
-      ].join('\n'),
-    )
-  }
-
-  return sendJson(res, 404, { ok: false, error: 'Not found' })
+    return sendJson(res, 404, { ok: false, error: 'Not found' })
   } catch (err) {
     if (isBodyTooLargeError(err)) {
       return sendRequestBodyTooLarge(res, err)
@@ -1034,7 +167,13 @@ const handler = async (req, res) => {
   }
 }
 
-await bootstrap()
+// --- bootstrap + listen --------------------------------------------------
+await persistenceBootstrap({
+  dataDir: config.dataDir,
+  notificationsFile,
+  repliesFile,
+  approvalsFile,
+})
 
 const bindHosts = resolveBindHosts()
 const servers = bindHosts.map((bindHost) => {
@@ -1044,8 +183,8 @@ const servers = bindHosts.map((bindHost) => {
     process.exitCode = 1
     shutdown('listen-error')
   })
-  s.listen(port, bindHost, () => {
-    log(`notification-hub listening on http://${bindHost}:${port}`)
+  s.listen(config.port, bindHost, () => {
+    log(`notification-hub listening on http://${bindHost}:${config.port}`)
   })
   return s
 })
