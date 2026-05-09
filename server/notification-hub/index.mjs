@@ -60,8 +60,9 @@ const hubReplyRelayTimeoutMs = Math.max(
   1000,
   Number.parseInt(process.env.HUB_REPLY_RELAY_TIMEOUT_MS || '15000', 10) || 15000,
 )
+// Phase 1 voice/text commands ride the same relay path; allowlist them by default.
 const hubReplyRelaySources = new Set(
-  String(process.env.HUB_REPLY_RELAY_SOURCES || 'g2,web')
+  String(process.env.HUB_REPLY_RELAY_SOURCES || 'g2,web,g2_voice,g2_text')
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean),
@@ -1373,6 +1374,99 @@ const handler = async (req, res) => {
     return
   }
 
+  if (method === 'POST' && pathname === '/api/v1/command') {
+    let rawBody
+    try {
+      rawBody = await readRequestBody(req, { maxBytes: hubMaxBodyBytes })
+    } catch (err) {
+      if (isBodyTooLargeError(err)) return sendRequestBodyTooLarge(res, err)
+      throw err
+    }
+    const parsed = safeJsonParse(rawBody || '{}')
+    if (!parsed.ok || !parsed.value || typeof parsed.value !== 'object') {
+      return sendJson(res, 400, { ok: false, error: 'invalid JSON body' })
+    }
+    const p = parsed.value
+    const source = typeof p.source === 'string' ? p.source : ''
+    if (source !== 'g2_voice' && source !== 'g2_text') {
+      return sendJson(res, 400, { ok: false, error: source ? 'invalid source' : 'source is required' })
+    }
+    if (typeof p.text !== 'string') {
+      return sendJson(res, 400, { ok: false, error: 'text is required' })
+    }
+    const sanitizedText = p.text.replace(/[\x00-\x08\x0B-\x1F\x7F]/g, '').trim()
+    if (!sanitizedText) {
+      return sendJson(res, 400, { ok: false, error: 'text is required' })
+    }
+    if (sanitizedText.length > 2000) {
+      return sendJson(res, 400, { ok: false, error: 'text too long' })
+    }
+    let transcriptConfidence
+    if (p.transcript_confidence != null) {
+      const n = Number(p.transcript_confidence)
+      if (Number.isFinite(n) && n >= 0 && n <= 1) transcriptConfidence = n
+    }
+    let tmuxTarget
+    if (p.tmux_target != null) {
+      if (typeof p.tmux_target !== 'string' || !/^[A-Za-z0-9_./:-]{1,128}$/.test(p.tmux_target)) {
+        return sendJson(res, 400, { ok: false, error: 'invalid tmux_target' })
+      }
+      tmuxTarget = p.tmux_target
+    }
+
+    const commandId = `cmd_${randomUUID()}`
+    const createdAt = new Date().toISOString()
+    // hookType=g2-command keeps reply-relay.sh on the plain-text branch (not approval keypress).
+    const notification = {
+      id: commandId,
+      source: 'claude-code',
+      title: '[g2-command]',
+      summary: sanitizedText.slice(0, 80),
+      fullText: sanitizedText,
+      createdAt,
+      replyCapable: false,
+      metadata: {
+        hookType: 'g2-command',
+        ...(tmuxTarget ? { tmuxTarget } : {}),
+        ...(transcriptConfidence != null ? { transcriptConfidence } : {}),
+      },
+    }
+    /** @type {ReplyRecord} */
+    const reply = {
+      id: `cmdrep_${randomUUID()}`,
+      notificationId: commandId,
+      replyText: sanitizedText,
+      createdAt,
+      status: 'stubbed',
+      action: 'comment',
+      source,
+    }
+
+    notifications.push(notification)
+    notificationsById.set(notification.id, notification)
+    await appendJsonl(notificationsFile, notification)
+
+    const relay = await relayReplyIfConfigured({ reply, notification })
+    if (relay.status === 'forwarded') reply.status = 'forwarded'
+    else if (relay.status === 'failed') reply.status = 'failed'
+    else reply.status = 'stubbed'
+    if (relay.error) reply.error = relay.error
+    replies.push(reply)
+    await appendJsonl(repliesFile, reply)
+
+    log(
+      `command accepted id=${commandId} source=${source} length=${sanitizedText.length} status=${relay.status}`,
+    )
+
+    if (relay.status === 'failed') {
+      return sendJson(res, 502, { ok: false, error: 'relay failed', details: relay.error })
+    }
+    if (relay.status === 'stubbed') {
+      return sendJson(res, 200, { ok: true, delivered_at: createdAt, relay: 'stubbed' })
+    }
+    return sendJson(res, 200, { ok: true, delivered_at: createdAt })
+  }
+
   if (method === 'GET' && pathname === '/') {
     return sendText(
       res,
@@ -1391,6 +1485,8 @@ const handler = async (req, res) => {
         'GET  /api/approvals              (list pending approvals)',
         'GET  /api/approvals/:id          (poll approval status)',
         'POST /api/approvals/:id/decide   (submit decision)',
+        '',
+        'POST /api/v1/command             (free-text command from G2)',
         '',
         'GET  /ui                         (approval dashboard)',
         'POST /api/client-events          (frontend event log intake)',
