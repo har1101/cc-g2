@@ -1,20 +1,12 @@
 // /api/health, /api/healthz, / (index banner)
 import { sendJson, sendText } from '../core/http.mjs'
-import * as store from '../state/store.mjs'
+import { getHealthSummary } from '../services/health-service.mjs'
 
 export async function handle(req, res, ctx) {
   const { method, pathname } = ctx
 
   if (method === 'GET' && (pathname === '/api/health' || pathname === '/api/healthz')) {
-    sendJson(res, 200, {
-      ok: true,
-      service: 'notification-hub',
-      notifications: store.notifications.length,
-      replies: store.replies.length,
-      approvals: store.approvals.length,
-      pendingApprovals: store.approvals.filter((a) => a.status === 'pending').length,
-      now: new Date().toISOString(),
-    })
+    sendJson(res, 200, getHealthSummary())
     return true
   }
 
