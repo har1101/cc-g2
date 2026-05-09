@@ -54,6 +54,12 @@ import {
   listNotifications,
   persistReply,
 } from './services/notification-service.mjs'
+import {
+  cleanupApprovalsOnStop as approvalServiceCleanupOnStop,
+  createApproval as approvalServiceCreate,
+  markApprovalCleanup as approvalServiceMarkCleanup,
+  resolveApproval as approvalServiceResolve,
+} from './services/approval-service.mjs'
 
 const legacyHubBind = process.env.HUB_BIND
 const bindModeRaw = process.env.HUB_BIND_MODE
@@ -143,19 +149,33 @@ async function addNotification(payload, logPrefix = 'notification') {
   if (hookType === 'stop') {
     const sessionId = item.metadata?.sessionId
     if (sessionId) {
-      const now = new Date().toISOString()
-      for (const a of approvals) {
-        if (a.status === 'pending') {
-          const n = notificationsById.get(a.notificationId)
-          if (n?.metadata?.sessionId === sessionId) {
-            markApprovalCleanup(a, 'session-ended', 'auto-session-end', now)
-            log(`approval auto-cleaned on stop id=${a.id} session=${sessionId}`)
-          }
-        }
-      }
+      approvalServiceCleanupOnStop(
+        { sessionId, decidedAt: new Date().toISOString() },
+        approvalCfg(),
+      )
     }
   }
   return result
+}
+
+function approvalCfg() {
+  return { approvalsFile, persistToolInput: hubPersistToolInput }
+}
+
+async function createApproval(params) {
+  return approvalServiceCreate(params, {
+    addNotification,
+    approvalsFile,
+    persistToolInput: hubPersistToolInput,
+  })
+}
+
+function resolveApproval(approvalId, decision, comment, decidedBy) {
+  return approvalServiceResolve(approvalId, decision, comment, decidedBy, approvalCfg())
+}
+
+function markApprovalCleanup(record, resolution, decidedBy, decidedAt) {
+  return approvalServiceMarkCleanup(record, resolution, decidedBy, decidedAt, approvalCfg())
 }
 
 async function relayReplyIfConfigured(payload, opts = {}) {
@@ -220,112 +240,6 @@ async function relayReplyIfConfigured(payload, opts = {}) {
     child.stdin.write(JSON.stringify(payload))
     child.stdin.end()
   })
-}
-
-async function createApproval(params) {
-  const {
-    source, toolName, toolInput, toolId, cwd, reason,
-    agentName, title: titleOverride, body: bodyOverride, metadata: extraMeta,
-    threadId: incomingThreadId,
-  } = params
-
-  const approvalId = randomUUID()
-  const now = new Date().toISOString()
-
-  const lines = []
-  lines.push(`Tool: ${toolName}`)
-  if (cwd) lines.push(`CWD: ${cwd}`)
-  if (reason) lines.push(`理由: ${reason}`)
-  const inputPreview = typeof toolInput === 'object' && toolInput !== null
-    ? (toolInput.command || toolInput.file_path || JSON.stringify(toolInput))
-    : String(toolInput || '')
-  if (inputPreview) lines.push('', `$ ${inputPreview}`)
-
-  const title = titleOverride || toolName
-  const fullText = bodyOverride || lines.join('\n')
-
-  const callerHookType = (extraMeta && typeof extraMeta.hookType === 'string')
-    ? extraMeta.hookType
-    : 'permission-request'
-  const notifPayload = {
-    title,
-    body: fullText,
-    hookType: callerHookType,
-    threadId: incomingThreadId || undefined,
-    metadata: {
-      ...extraMeta,
-      hookType: callerHookType,
-      approvalId,
-      externalId: `approval:${approvalId}`,
-      source: `${agentName}-approval-broker`,
-      toolName,
-      toolId,
-      cwd: cwd || undefined,
-      agentName,
-    },
-  }
-  const { item: notification } = await addNotification(notifPayload, 'approval-broker')
-
-  /** @type {ApprovalRecord} */
-  const record = {
-    id: approvalId,
-    notificationId: notification.id,
-    source: source || agentName,
-    toolName,
-    toolInput,
-    toolId: toolId || '',
-    cwd: cwd || '',
-    reason: reason || '',
-    agentName: agentName || '',
-    status: 'pending',
-    createdAt: now,
-  }
-  approvals.push(record)
-  approvalsById.set(record.id, record)
-  approvalsByNotificationId.set(notification.id, record)
-  await appendJsonl(approvalsFile, persistedApproval(record, { persistToolInput: hubPersistToolInput }))
-
-  log(`approval created id=${record.id} notificationId=${notification.id} tool=${toolName}`)
-  return { approval: record, notification }
-}
-
-function resolveApproval(approvalId, decision, comment, decidedBy) {
-  const record = approvalsById.get(approvalId)
-  if (!record) return null
-  if (record.status !== 'pending') return record
-  record.status = 'decided'
-  record.decision = decision
-  record.resolution = undefined
-  record.comment = comment || undefined
-  record.decidedBy = decidedBy || undefined
-  record.decidedAt = new Date().toISOString()
-  appendJsonl(
-    approvalsFile,
-    persistedApproval({ ...record, _event: 'decided' }, { persistToolInput: hubPersistToolInput }),
-  ).catch((err) =>
-    log(`approval persist error ${err instanceof Error ? err.message : String(err)}`),
-  )
-  log(`approval decided id=${record.id} decision=${decision} by=${decidedBy || 'unknown'}`)
-  return record
-}
-
-function markApprovalCleanup(record, resolution, decidedBy, decidedAt = new Date().toISOString()) {
-  if (!record || record.status !== 'pending') return record
-  record.status = 'decided'
-  record.decision = undefined
-  record.resolution = resolution
-  record.comment = undefined
-  record.decidedBy = decidedBy || undefined
-  record.decidedAt = decidedAt
-  record.deliveredAt = decidedAt
-  appendJsonl(
-    approvalsFile,
-    persistedApproval({ ...record, _event: 'decided' }, { persistToolInput: hubPersistToolInput }),
-  ).catch((err) =>
-    log(`approval persist error ${err instanceof Error ? err.message : String(err)}`),
-  )
-  log(`approval cleaned up id=${record.id} resolution=${resolution} by=${decidedBy || 'unknown'}`)
-  return record
 }
 
 function matchApprovalPath(pathname) {
