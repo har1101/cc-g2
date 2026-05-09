@@ -20,6 +20,7 @@ import {
   store,
   type ContextSession,
 } from './state/store'
+import { createAudioSession, type AudioSession, type AudioSessionHandle } from './audio-session'
 
 const appRoot = document.querySelector<HTMLDivElement>('#app')!
 const uiSearch = new URLSearchParams(globalThis.location?.search || '')
@@ -116,6 +117,14 @@ const notifClient = createNotificationClient(appConfig.notificationHubUrl)
 // 全 module-level state は src/state/store.ts に集約 (Phase 1.5b)。
 // 短いエイリアス notifState を残して既存の "notifState.screen" などの記述を保つ。
 const notifState = store.notif
+
+// Audio session (Phase 1.5b): connection 初期化後に一度だけ作る。 各 owner
+// (reply-comment / voice-command / dev-mic) は acquire() で排他取得し、
+// 終了時に release() する。 release は冪等なので途中失敗でも安全に呼べる。
+let audioSession: AudioSession | null = null
+let currentReplyAudioHandle: AudioSessionHandle | null = null
+let currentVoiceAudioHandle: AudioSessionHandle | null = null
+let currentDevAudioHandle: AudioSessionHandle | null = null
 
 const DETAIL_SCROLL_COOLDOWN_MS = 250
 const TAP_SCROLL_SUPPRESS_MS = 150
@@ -307,33 +316,13 @@ document.getElementById('connect-btn')!.addEventListener('click', async () => {
       store.dev.speechCapabilityLogged = true
     }
 
-    if (!store.dev.audioListenerAttached) {
-      const audioInfo = document.getElementById('audio-info')!
-      connection.onAudio((pcm: Uint8Array) => {
-        // reply 録音が voice-command より優先（Phase 1 の単純な所有権分離）
-        if (store.reply.isRecording) {
-          store.reply.audioChunks.push(pcm)
-          store.reply.audioTotalBytes += pcm.length
-          return
-        }
-
-        if (store.voice.isRecording) {
-          store.voice.audioChunks.push(pcm)
-          store.voice.audioTotalBytes += pcm.length
-          return
-        }
-
-        if (!store.dev.isRecording) return
-
-        store.dev.audioChunks.push(pcm)
-        store.dev.audioTotalBytes += pcm.length
-        const durationMs = (store.dev.audioTotalBytes / 2) / 16 // 16kHz, 16bit = 2 bytes/sample
-        audioInfo.textContent = [
-          `チャンク数: ${store.dev.audioChunks.length}`,
-          `合計バイト: ${store.dev.audioTotalBytes}`,
-          `推定時間: ${(durationMs / 1000).toFixed(1)}秒`,
-          `最新チャンク: ${pcm.length} bytes`,
-        ].join('\n')
+    if (!audioSession) {
+      // PCM listener は audio-session が一度だけ登録する。
+      // 各 owner の acquire/handle.onPcm/release で chunks を集める。
+      audioSession = createAudioSession({
+        startAudio: () => connection!.startAudio(),
+        stopAudio: () => connection!.stopAudio(),
+        onAudio: (handler) => connection!.onAudio(handler),
       })
       store.dev.audioListenerAttached = true
     }
@@ -379,22 +368,15 @@ document.getElementById('approval-btn')!.addEventListener('click', async () => {
 
 // --- Mic ---
 document.getElementById('mic-start-btn')!.addEventListener('click', async () => {
-  if (!connection) {
+  if (!connection || !audioSession) {
     log('未接続です。先にConnectしてください。')
     return
   }
   resetDevAudio()
-  store.dev.isRecording = true
   const micStatus = document.getElementById('mic-status')!
   const startBtn = document.getElementById('mic-start-btn') as HTMLButtonElement
   const stopBtn = document.getElementById('mic-stop-btn') as HTMLButtonElement
   const audioInfo = document.getElementById('audio-info')!
-
-  startBtn.disabled = true
-  stopBtn.disabled = false
-  micStatus.textContent = '録音中...'
-  audioInfo.textContent = ''
-  log('マイク開始')
 
   store.dev.webSpeechFinalText = ''
   store.dev.webSpeechInterimText = ''
@@ -422,7 +404,33 @@ document.getElementById('mic-start-btn')!.addEventListener('click', async () => 
     await glassesUI.ensureBasePage(connection, 'マイク録音中...')
   }
 
-  await connection.startAudio()
+  try {
+    currentDevAudioHandle = await audioSession.acquire('dev-mic')
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    log(`マイク開始失敗: ${msg}`)
+    micStatus.textContent = `開始失敗: ${msg}`
+    return
+  }
+  store.dev.isRecording = true
+  startBtn.disabled = true
+  stopBtn.disabled = false
+  micStatus.textContent = '録音中...'
+  audioInfo.textContent = ''
+  log('マイク開始')
+
+  currentDevAudioHandle.onPcm((pcm) => {
+    if (!store.dev.isRecording) return
+    store.dev.audioChunks.push(pcm)
+    store.dev.audioTotalBytes += pcm.length
+    const durationMs = (store.dev.audioTotalBytes / 2) / 16 // 16kHz, 16bit = 2 bytes/sample
+    audioInfo.textContent = [
+      `チャンク数: ${store.dev.audioChunks.length}`,
+      `合計バイト: ${store.dev.audioTotalBytes}`,
+      `推定時間: ${(durationMs / 1000).toFixed(1)}秒`,
+      `最新チャンク: ${pcm.length} bytes`,
+    ].join('\n')
+  })
 })
 
 document.getElementById('mic-stop-btn')!.addEventListener('click', async () => {
@@ -432,8 +440,11 @@ document.getElementById('mic-stop-btn')!.addEventListener('click', async () => {
   const stopBtn = document.getElementById('mic-stop-btn') as HTMLButtonElement
   const audioInfo = document.getElementById('audio-info')!
 
-  await connection.stopAudio()
   store.dev.isRecording = false
+  if (currentDevAudioHandle) {
+    await currentDevAudioHandle.release()
+    currentDevAudioHandle = null
+  }
   if (appConfig.webSpeechCompare && store.dev.webSpeechSession) {
     try {
       const ws = await store.dev.webSpeechSession.stop()
@@ -778,6 +789,45 @@ const clearVoiceCommandRecordingMaxTimer = clearVoiceRecordingMaxTimer
 const clearVoiceCommandDoneTimer = clearVoiceDoneTimer
 const resetVoiceCommandStateToIdle = resetVoiceToIdle
 
+/**
+ * reply (permission コメント) 録音を開始するヘルパ。
+ * 旧コードでは 3 箇所 (detail-actions のコメント / ask-question の "その他（音声）" /
+ * reply-confirm の再録) で `await connection.startAudio()` を直接呼んでいたが、
+ * Phase 1.5b では audio-session.acquire('reply-comment') 経由で排他取得し、
+ * onPcm で chunks を貯める。 失敗時は handle が undefined のまま return される。
+ */
+async function startReplyAudioRecording(): Promise<boolean> {
+  if (!connection || !audioSession) return false
+  resetReplyAudio()
+  try {
+    currentReplyAudioHandle = await audioSession.acquire('reply-comment')
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    log(`返信録音 開始失敗: ${msg}`)
+    return false
+  }
+  currentReplyAudioHandle.onPcm((pcm) => {
+    if (!store.reply.isRecording) return
+    store.reply.audioChunks.push(pcm)
+    store.reply.audioTotalBytes += pcm.length
+  })
+  store.reply.isRecording = true
+  return true
+}
+
+/** reply 録音を停止。 audio handle を解放する。 stopAudio 失敗時もログだけ吐いて続行 */
+async function stopReplyAudioRecording(): Promise<void> {
+  store.reply.isRecording = false
+  if (currentReplyAudioHandle) {
+    try {
+      await currentReplyAudioHandle.release()
+    } catch (err) {
+      log(`返信録音 stopAudio失敗: ${err instanceof Error ? err.message : String(err)}`)
+    }
+    currentReplyAudioHandle = null
+  }
+}
+
 async function startVoiceCommandRecording() {
   if (!connection) return
   if (store.voice.startInFlight) {
@@ -802,7 +852,13 @@ async function startVoiceCommandRecording() {
     if (connection.mode === 'bridge' && !glassesUI.hasRenderedPage(connection)) {
       await glassesUI.ensureBasePage(connection, '音声コマンド録音中...')
     }
-    await connection.startAudio()
+    if (!audioSession) throw new Error('audio-session not initialized')
+    currentVoiceAudioHandle = await audioSession.acquire('voice-command')
+    currentVoiceAudioHandle.onPcm((pcm) => {
+      if (!store.voice.isRecording) return
+      store.voice.audioChunks.push(pcm)
+      store.voice.audioTotalBytes += pcm.length
+    })
 
     clearVoiceCommandRecordingMaxTimer()
     store.voice.recordingMaxTimer = setTimeout(() => {
@@ -818,6 +874,10 @@ async function startVoiceCommandRecording() {
     // 既にスケジュール済みのコールバックが返ってきても無視されるようにする。
     resetVoiceCommandStateToIdle()
     store.voice.generation++
+    if (currentVoiceAudioHandle) {
+      try { await currentVoiceAudioHandle.release() } catch { /* ignore */ }
+      currentVoiceAudioHandle = null
+    }
     try {
       await returnToIdleFromVoiceCommand('start-failed')
     } catch (idleErr) {
@@ -856,7 +916,10 @@ async function stopVoiceCommandRecording(reason: string) {
   try {
     if (store.voice.isRecording) {
       store.voice.isRecording = false
-      await connection.stopAudio()
+      if (currentVoiceAudioHandle) {
+        await currentVoiceAudioHandle.release()
+        currentVoiceAudioHandle = null
+      }
     }
     if (!isStillCurrent()) {
       log(`voice-command: stop result discarded (cancelled) reason=${reason} stage=stopAudio`)
@@ -924,10 +987,13 @@ async function cancelVoiceCommandRecording(reason: string) {
   clearVoiceCommandRecordingMaxTimer()
   if (store.voice.isRecording) {
     store.voice.isRecording = false
-    try {
-      await connection.stopAudio()
-    } catch (err) {
-      log(`voice-command stopAudio失敗: ${err instanceof Error ? err.message : String(err)}`)
+    if (currentVoiceAudioHandle) {
+      try {
+        await currentVoiceAudioHandle.release()
+      } catch (err) {
+        log(`voice-command stopAudio失敗: ${err instanceof Error ? err.message : String(err)}`)
+      }
+      currentVoiceAudioHandle = null
     }
   }
   store.voice.audioChunks = []
@@ -1310,17 +1376,13 @@ async function handleNotifEvent(conn: BridgeConnection, event: EvenHubEvent) {
             log('通知アクション: コメント（録音開始）')
             notifState.screen = 'reply-recording'
             notifState.replyText = ''
-            store.reply.audioChunks = []
-            store.reply.audioTotalBytes = 0
-            store.reply.stopInFlight = false
 
             await glassesUI.showReplyRecording(connection!)
 
             if (connection!.mode === 'bridge' && !glassesUI.hasRenderedPage(connection!)) {
               await glassesUI.ensureBasePage(connection!, 'マイク録音中...')
             }
-            await connection!.startAudio()
-            store.reply.isRecording = true
+            await startReplyAudioRecording()
             updateNotifInfo()
             return
           }
@@ -1367,15 +1429,11 @@ async function handleNotifEvent(conn: BridgeConnection, event: EvenHubEvent) {
             log('AskUserQuestion: その他（音声入力）')
             notifState.screen = 'reply-recording'
             notifState.replyText = ''
-            store.reply.audioChunks = []
-            store.reply.audioTotalBytes = 0
-            store.reply.stopInFlight = false
             await glassesUI.showReplyRecording(connection!)
             if (connection!.mode === 'bridge' && !glassesUI.hasRenderedPage(connection!)) {
               await glassesUI.ensureBasePage(connection!, 'マイク録音中...')
             }
-            await connection!.startAudio()
-            store.reply.isRecording = true
+            await startReplyAudioRecording()
             updateNotifInfo()
             return
           }
@@ -1436,8 +1494,7 @@ async function handleNotifEvent(conn: BridgeConnection, event: EvenHubEvent) {
           }
           store.reply.stopInFlight = true
           log('返信録音: 停止 → STT処理開始')
-          store.reply.isRecording = false
-          await connection!.stopAudio()
+          await stopReplyAudioRecording()
 
           await glassesUI.showReplySttProcessing(connection!)
 
@@ -1511,8 +1568,7 @@ async function handleNotifEvent(conn: BridgeConnection, event: EvenHubEvent) {
         // スクロール入力はキャンセル → 前画面に戻る
         if (eventType === G2_EVENT.SCROLL_TOP || eventType === G2_EVENT.SCROLL_BOTTOM) {
           log('返信録音: キャンセル → 前画面に戻る')
-          store.reply.isRecording = false
-          await connection!.stopAudio()
+          await stopReplyAudioRecording()
           if (notifState.detailItem && isAskUserQuestionNotification(notifState.detailItem) && notifState.askQuestions.length > 0) {
             notifState.screen = 'ask-question'
             const q = notifState.askQuestions[notifState.askQuestionIndex]
@@ -1583,11 +1639,8 @@ async function handleNotifEvent(conn: BridgeConnection, event: EvenHubEvent) {
             log('返信確認: 再録')
             notifState.screen = 'reply-recording'
             notifState.replyText = ''
-            store.reply.audioChunks = []
-            store.reply.audioTotalBytes = 0
             await glassesUI.showReplyRecording(connection!)
-            await connection!.startAudio()
-            store.reply.isRecording = true
+            await startReplyAudioRecording()
             updateNotifInfo()
             return
           }
