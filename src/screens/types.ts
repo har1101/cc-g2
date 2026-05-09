@@ -44,8 +44,13 @@ export type ScreenContext = {
   audioSession: AudioSession
   /** 描画ジョブの直列化 (Phase 1.5b) */
   renderQueue: RenderQueue
-  /** STT engine (groq-batch / Phase 2: deepgram-stream) */
+  /** STT engine for voice-command path (groq-batch / Phase 2: deepgram-stream) */
   sttEngine: SttEngine
+  /**
+   * STT engine for permission コメント (返信) path. Phase 2 以降、 voice-command
+   * は streaming に切り替わっても、 短文の reply パスは常に groq-batch を維持する。
+   */
+  sttEngineForReply: SttEngine
   /** ログ出力 (UI #event-log + console) */
   log: (msg: string) => void
 
@@ -73,6 +78,9 @@ export type ScreenContext = {
   sendVoiceCommandAndShowResult(): Promise<void>
   returnToIdleFromVoiceCommand(reason: string): Promise<void>
   scheduleVoiceCommandDoneReturn(): void
+  // ----- voice-command streaming (Phase 2) -----
+  finalizeVoiceCommandStreaming(reason: string): Promise<void>
+  cancelVoiceCommandStreaming(reason: string): Promise<void>
 
   // ----- reply (permission コメント) lifecycle -----
   startReplyAudioRecording(): Promise<boolean>

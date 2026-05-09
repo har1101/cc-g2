@@ -14,7 +14,7 @@ import type { AskQuestionData } from '../glasses-ui'
 import type { GlassesUI } from './types'
 import type { AudioSession, AudioSessionHandle } from '../audio-session'
 import type { RenderQueue } from '../render-queue'
-import type { SttEngine } from '../stt/engine'
+import type { SttEngine, SttSession } from '../stt/engine'
 import type { createNotificationClient } from '../notifications'
 import type { NotificationDetail } from '../notifications'
 import {
@@ -46,7 +46,17 @@ export type HelperDeps = {
   glassesUI: GlassesUI
   notifClient: ReturnType<typeof createNotificationClient>
   renderQueue: RenderQueue
+  /**
+   * Voice-command 用 STT engine。 `VITE_STT_ENGINE_VOICE_COMMAND` で
+   * `groq-batch` (default) か `deepgram-stream` を選ぶ。
+   */
   sttEngine: SttEngine
+  /**
+   * Permission コメント (返信) 用 STT engine。 短文向けで always groq-batch。
+   * 1.5c までは voice-command と同じ engine を共有していたが、 Phase 2 で
+   * permission パスはストリーミングのオーバーヘッドが見合わないため別 inject。
+   */
+  sttEngineForReply: SttEngine
   log: (msg: string) => void
   appConfig: {
     notificationIdleDimMode: boolean
@@ -74,6 +84,26 @@ function need(): HelperDeps {
 
 let currentReplyAudioHandle: AudioSessionHandle | null = null
 let currentVoiceAudioHandle: AudioSessionHandle | null = null
+/**
+ * Phase 2: Deepgram streaming session held while the
+ * voice-command-recording-streaming screen is active. Owned by
+ * `startVoiceCommandRecordingStreaming` and released by finalize/cancel.
+ */
+let currentVoiceSttSession: SttSession | null = null
+let currentVoiceSttRedrawTimer: ReturnType<typeof setTimeout> | null = null
+let voiceSttRedrawDirty = false
+
+/** Test helper: clear all module-level state (used by unit tests). */
+export function _resetHelpersForTest(): void {
+  currentReplyAudioHandle = null
+  currentVoiceAudioHandle = null
+  currentVoiceSttSession = null
+  if (currentVoiceSttRedrawTimer) {
+    clearTimeout(currentVoiceSttRedrawTimer)
+    currentVoiceSttRedrawTimer = null
+  }
+  voiceSttRedrawDirty = false
+}
 
 /** dev-mic は main.ts (Connect / Mic ボタン) からのみ使うので main.ts 側に置く */
 
@@ -256,7 +286,25 @@ export async function stopReplyAudioRecording(): Promise<void> {
 // voice-command 録音
 // ---------------------------------------------------------------------------
 
+/**
+ * Public entry: start voice-command recording.
+ *
+ * Phase 2: dispatch on `sttEngine.kind`.
+ * - `groq-batch` → existing batch path (record → finalize → confirm)
+ * - `deepgram-stream` → streaming path (live partials on G2)
+ *
+ * permission-comment (返信) パスはこの関数を経由しないため、 engine 切替の影響を受けない。
+ */
 export async function startVoiceCommandRecording(): Promise<void> {
+  const d = need()
+  if (d.sttEngine.kind === 'deepgram-stream') {
+    await startVoiceCommandRecordingStreaming()
+    return
+  }
+  await startVoiceCommandRecordingBatch()
+}
+
+async function startVoiceCommandRecordingBatch(): Promise<void> {
   const d = need()
   const conn = d.getConnection()
   if (!conn) return
@@ -318,6 +366,248 @@ export async function startVoiceCommandRecording(): Promise<void> {
   } finally {
     store.voice.startInFlight = false
   }
+}
+
+// ---------------------------------------------------------------------------
+// voice-command 録音 (streaming, Phase 2)
+// ---------------------------------------------------------------------------
+
+const STREAM_REDRAW_INTERVAL_MS = 150 // ~6.6Hz
+
+function scheduleStreamRedraw(): void {
+  voiceSttRedrawDirty = true
+  if (currentVoiceSttRedrawTimer) return
+  currentVoiceSttRedrawTimer = setTimeout(() => {
+    currentVoiceSttRedrawTimer = null
+    if (!voiceSttRedrawDirty) return
+    voiceSttRedrawDirty = false
+    flushStreamRedraw()
+  }, STREAM_REDRAW_INTERVAL_MS)
+}
+
+function flushStreamRedraw(): void {
+  const d = need()
+  const conn = d.getConnection()
+  if (!conn) return
+  if (store.notif.screen !== 'voice-command-recording-streaming') return
+  const elapsedMs = Date.now() - store.voice.startedAt
+  // fire-and-forget — caller throttles
+  void d.glassesUI.showVoiceCommandRecordingStreaming(conn, {
+    stableText: store.voice.stableText,
+    partialText: store.voice.partialText,
+    elapsedMs,
+  }).catch((err) => {
+    d.log(`voice-command-streaming redraw失敗: ${err instanceof Error ? err.message : String(err)}`)
+  })
+}
+
+async function startVoiceCommandRecordingStreaming(): Promise<void> {
+  const d = need()
+  const conn = d.getConnection()
+  if (!conn) return
+  if (store.voice.startInFlight) {
+    d.log('voice-command-streaming: 重複開始イベントを無視 (start-in-flight)')
+    return
+  }
+  store.voice.startInFlight = true
+  const gen = bumpVoiceGeneration()
+  try {
+    store.voice.audioChunks = []
+    store.voice.audioTotalBytes = 0
+    store.voice.finalText = ''
+    store.voice.stableText = ''
+    store.voice.partialText = ''
+    store.voice.stableSeq = 0
+    store.voice.partialSeq = 0
+    store.voice.preFinalText = ''
+    store.voice.sendOrCancelInProgress = false
+    store.voice.stopInFlight = false
+    store.voice.startedAt = Date.now()
+    store.voice.isRecording = true
+    store.notif.screen = 'voice-command-recording-streaming'
+
+    await d.glassesUI.showVoiceCommandRecordingStreaming(conn, { stableText: '', partialText: '', elapsedMs: 0 })
+    if (conn.mode === 'bridge' && !d.glassesUI.hasRenderedPage(conn)) {
+      await d.glassesUI.ensureBasePage(conn, '音声コマンド録音中...')
+    }
+
+    const audioSession = d.getAudioSession()
+    if (!audioSession) throw new Error('audio-session not initialized')
+    currentVoiceAudioHandle = await audioSession.acquire('voice-command')
+
+    // Open the streaming engine BEFORE wiring PCM, so early chunks aren't dropped.
+    let session: SttSession
+    try {
+      session = await d.sttEngine.start({ voiceSessionId: `voice-${gen}`, lang: 'ja' })
+    } catch (err) {
+      // Engine could not connect (no_api_key / network). Reset and bail.
+      d.log(`voice-command-streaming: engine start失敗 ${err instanceof Error ? err.message : String(err)}`)
+      try { await currentVoiceAudioHandle.release() } catch { /* ignore */ }
+      currentVoiceAudioHandle = null
+      throw err
+    }
+    currentVoiceSttSession = session
+
+    if (typeof session.onPartial === 'function') {
+      session.onPartial((p) => {
+        if (store.voice.generation !== gen) return
+        // monotonic seq guard (server already drops stale, but client double-checks)
+        if (p.partial_seq < store.voice.partialSeq) return
+        if (p.stable_seq < store.voice.stableSeq) return
+        store.voice.stableSeq = p.stable_seq
+        store.voice.partialSeq = p.partial_seq
+        store.voice.stableText = p.stable_text
+        store.voice.partialText = p.partial_text
+        scheduleStreamRedraw()
+      })
+    }
+    if (typeof session.onError === 'function') {
+      session.onError((err) => {
+        d.log(`voice-command-streaming: engine error code=${err.code} msg=${err.message}`)
+      })
+    }
+
+    currentVoiceAudioHandle.onPcm((pcm) => {
+      if (!store.voice.isRecording) return
+      void session.pushPcm(pcm).catch(() => { /* swallowed; engine surfaces via onError */ })
+    })
+
+    clearVoiceRecordingMaxTimer()
+    store.voice.recordingMaxTimer = setTimeout(() => {
+      void finalizeVoiceCommandStreaming('timeout')
+    }, VOICE_COMMAND_RECORDING_MAX_MS)
+
+    d.updateNotifInfo()
+    d.log(`voice-command-streaming: 録音開始 gen=${gen}`)
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    d.log(`voice-command-streaming: 録音開始失敗 ${msg}`)
+    resetVoiceToIdle()
+    bumpVoiceGeneration()
+    if (currentVoiceSttSession) {
+      try { await currentVoiceSttSession.cancel() } catch { /* ignore */ }
+      currentVoiceSttSession = null
+    }
+    if (currentVoiceAudioHandle) {
+      try { await currentVoiceAudioHandle.release() } catch { /* ignore */ }
+      currentVoiceAudioHandle = null
+    }
+    try {
+      await returnToIdleFromVoiceCommand('start-failed-streaming')
+    } catch {
+      store.notif.screen = 'idle'
+    }
+  } finally {
+    store.voice.startInFlight = false
+  }
+}
+
+/**
+ * Finalize the streaming session, transition to voice-command-confirm.
+ * Public entry from the screen handler (single tap → send).
+ */
+export async function finalizeVoiceCommandStreaming(reason: string): Promise<void> {
+  const d = need()
+  const conn = d.getConnection()
+  if (!conn) return
+  if (store.voice.stopInFlight) {
+    d.log(`voice-command-streaming: 重複停止イベントを無視 reason=${reason}`)
+    return
+  }
+  const gen = store.voice.generation
+  store.voice.stopInFlight = true
+  clearVoiceRecordingMaxTimer()
+
+  // Stop accepting new PCM immediately.
+  store.voice.isRecording = false
+  if (currentVoiceAudioHandle) {
+    try {
+      await currentVoiceAudioHandle.release()
+    } catch (err) {
+      d.log(`voice-command-streaming stopAudio失敗: ${err instanceof Error ? err.message : String(err)}`)
+    }
+    currentVoiceAudioHandle = null
+  }
+
+  if (store.voice.generation !== gen) {
+    store.voice.stopInFlight = false
+    return
+  }
+
+  const session = currentVoiceSttSession
+  if (!session) {
+    // Nothing to finalize — go back to idle.
+    store.voice.stopInFlight = false
+    await returnToIdleFromVoiceCommand('streaming-no-session')
+    return
+  }
+
+  try {
+    const elapsedMs = Date.now() - store.voice.startedAt
+    d.log(`voice-command-streaming: 停止 reason=${reason} gen=${gen} elapsed=${elapsedMs}ms`)
+    const stt = await session.finalize()
+    currentVoiceSttSession = null
+
+    if (store.voice.generation !== gen) {
+      d.log(`voice-command-streaming: 停止結果を破棄 (gen mismatch) reason=${reason}`)
+      return
+    }
+    const text = (stt.text ?? '').trim()
+    if (!text) {
+      d.log('voice-command-streaming: STT空 → idle')
+      await returnToIdleFromVoiceCommand('empty-streaming')
+      return
+    }
+    store.voice.finalText = text
+    // preFinalText: if a late stt.final arrives after the timeout, we'll
+    // diff against this and show the (updated) badge.
+    store.voice.preFinalText = text
+    store.notif.screen = 'voice-command-confirm'
+    await d.glassesUI.showVoiceCommandConfirm(conn, text)
+    d.updateNotifInfo()
+  } catch (err) {
+    d.log(`voice-command-streaming finalize失敗: ${err instanceof Error ? err.message : String(err)}`)
+    await returnToIdleFromVoiceCommand('streaming-finalize-error')
+  } finally {
+    store.voice.stopInFlight = false
+  }
+}
+
+/**
+ * Cancel the streaming session and return to idle. Public entry from the
+ * voice-command-recording-streaming screen handler (double tap).
+ */
+export async function cancelVoiceCommandStreaming(reason: string): Promise<void> {
+  const d = need()
+  const conn = d.getConnection()
+  if (!conn) return
+  bumpVoiceGeneration()
+  clearVoiceRecordingMaxTimer()
+  store.voice.isRecording = false
+  store.voice.sendOrCancelInProgress = true
+
+  if (currentVoiceSttSession) {
+    try { await currentVoiceSttSession.cancel() } catch { /* ignore */ }
+    currentVoiceSttSession = null
+  }
+  if (currentVoiceAudioHandle) {
+    try {
+      await currentVoiceAudioHandle.release()
+    } catch (err) {
+      d.log(`voice-command-streaming cancel stopAudio失敗: ${err instanceof Error ? err.message : String(err)}`)
+    }
+    currentVoiceAudioHandle = null
+  }
+  store.voice.audioChunks = []
+  store.voice.audioTotalBytes = 0
+  store.voice.finalText = ''
+  store.voice.stableText = ''
+  store.voice.partialText = ''
+  store.voice.stableSeq = 0
+  store.voice.partialSeq = 0
+  store.voice.preFinalText = ''
+  d.log(`voice-command-streaming: キャンセル reason=${reason}`)
+  await returnToIdleFromVoiceCommand(reason)
 }
 
 export async function stopVoiceCommandRecording(reason: string): Promise<void> {
@@ -437,9 +727,20 @@ export async function cancelVoiceCommandRecording(reason: string): Promise<void>
       currentVoiceAudioHandle = null
     }
   }
+  // Phase 2: streaming session は startVoiceCommandRecording の deepgram-stream
+  // ブランチで開かれているので、 念のためここでも release。
+  if (currentVoiceSttSession) {
+    try { await currentVoiceSttSession.cancel() } catch { /* ignore */ }
+    currentVoiceSttSession = null
+  }
   store.voice.audioChunks = []
   store.voice.audioTotalBytes = 0
   store.voice.finalText = ''
+  store.voice.stableText = ''
+  store.voice.partialText = ''
+  store.voice.stableSeq = 0
+  store.voice.partialSeq = 0
+  store.voice.preFinalText = ''
   d.log(`voice-command: キャンセル reason=${reason}`)
   await returnToIdleFromVoiceCommand(reason)
 }

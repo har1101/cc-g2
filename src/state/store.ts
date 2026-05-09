@@ -44,6 +44,20 @@ export type VoiceState = {
   sendCancelled: boolean
   recordingMaxTimer: ReturnType<typeof setTimeout> | null
   doneTimer: ReturnType<typeof setTimeout> | null
+  // ----- Phase 2: streaming state (Deepgram path) -----
+  /** confirmed-stable transcript so far (engine emits is_final → concatenated) */
+  stableText: string
+  /** in-flight not-yet-final transcript */
+  partialText: string
+  /** monotonically-increasing seq numbers (drop stale partials below these) */
+  stableSeq: number
+  partialSeq: number
+  /** late-final post-timeout: original confirm text, used by (updated) badge logic */
+  preFinalText: string
+  /** confirm 画面で "(updated)" バッジを 1 秒だけ表示する用 */
+  lateFinalUpdatedTimer: ReturnType<typeof setTimeout> | null
+  /** 送信が始まった (or キャンセル済み) → 遅延 final は破棄する */
+  sendOrCancelInProgress: boolean
 }
 
 /** Dev UI のマイクテスト用 audio バッファ */
@@ -140,6 +154,13 @@ function createStore(): Store {
     sendCancelled: false,
     recordingMaxTimer: null,
     doneTimer: null,
+    stableText: '',
+    partialText: '',
+    stableSeq: 0,
+    partialSeq: 0,
+    preFinalText: '',
+    lateFinalUpdatedTimer: null,
+    sendOrCancelInProgress: false,
   }
 
   const dev: DevMicState = {
@@ -206,6 +227,12 @@ export function resetVoiceToIdle(): void {
   store.voice.audioChunks = []
   store.voice.audioTotalBytes = 0
   store.voice.finalText = ''
+  store.voice.stableText = ''
+  store.voice.partialText = ''
+  store.voice.stableSeq = 0
+  store.voice.partialSeq = 0
+  store.voice.preFinalText = ''
+  store.voice.sendOrCancelInProgress = false
   if (store.voice.recordingMaxTimer) {
     clearTimeout(store.voice.recordingMaxTimer)
     store.voice.recordingMaxTimer = null
@@ -213,6 +240,10 @@ export function resetVoiceToIdle(): void {
   if (store.voice.doneTimer) {
     clearTimeout(store.voice.doneTimer)
     store.voice.doneTimer = null
+  }
+  if (store.voice.lateFinalUpdatedTimer) {
+    clearTimeout(store.voice.lateFinalUpdatedTimer)
+    store.voice.lateFinalUpdatedTimer = null
   }
 }
 

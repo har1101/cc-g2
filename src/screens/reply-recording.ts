@@ -33,7 +33,10 @@ async function returnToPrePreviousScreen(ctx: ScreenContext): Promise<void> {
 }
 
 export async function handle(event: NormalizedG2Event, ctx: ScreenContext): Promise<void> {
-  const { store, conn, glassesUI, sttEngine, log } = ctx
+  // Phase 2: permission コメント (返信) パスは常に groq-batch を使う。
+  // streaming engine は voice-command 専用 (短文には latency 旨味が薄いため)。
+  const { store, conn, glassesUI, sttEngineForReply, log } = ctx
+  const sttEngine = sttEngineForReply
   const eventType = event.eventType
 
   // 録音中画面:
