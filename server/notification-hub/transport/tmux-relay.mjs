@@ -4,6 +4,11 @@
 //
 // `bypassSourceFilter` is preserved so /api/v1/command (and Phase 4 session
 // routing) can opt out of the legacy HUB_REPLY_RELAY_SOURCES allowlist.
+//
+// Per-call env injection: the returned closure accepts an optional
+// `opts.tmuxTarget` (and is open for future per-call vars) so Phase 4 can
+// route reply-relay invocations to a session-specific tmux target via
+// RELAY_TMUX_TARGET without baking env at construction time.
 import { spawn } from 'node:child_process'
 
 /**
@@ -11,22 +16,24 @@ import { spawn } from 'node:child_process'
  * keeps callers (services/command-service) from depending on env-derived
  * hub config and lets index.mjs swap in a stub during tests if ever needed.
  *
+ * NOTE: `cfg.env` is intentionally NOT supported. Per-call env injection
+ * happens inside the returned closure so concurrent calls can pass different
+ * RELAY_TMUX_TARGET values without sharing mutable state.
+ *
  * @param {{
  *   cmd: string,                  // HUB_REPLY_RELAY_CMD (empty => stubbed)
  *   timeoutMs: number,            // HUB_REPLY_RELAY_TIMEOUT_MS
  *   allowedSources: Set<string>,  // HUB_REPLY_RELAY_SOURCES
- *   env?: NodeJS.ProcessEnv,      // child env (defaults to process.env)
  * }} cfg
  */
 export function createTmuxRelay(cfg) {
   const cmd = cfg.cmd
   const timeoutMs = cfg.timeoutMs
   const allowedSources = cfg.allowedSources
-  const childEnv = cfg.env || process.env
 
   /**
    * @param {{ reply?: { source?: string }, [k:string]: any }} payload
-   * @param {{ bypassSourceFilter?: boolean }} [opts]
+   * @param {{ bypassSourceFilter?: boolean, tmuxTarget?: string }} [opts]
    * @returns {Promise<{ status: 'stubbed'|'forwarded'|'failed', error?: string }>}
    */
   return async function relayReplyIfConfigured(payload, opts = {}) {
@@ -43,6 +50,11 @@ export function createTmuxRelay(cfg) {
     ) {
       return { status: 'stubbed' }
     }
+
+    // Per-call env: clone process.env and overlay any per-call variables.
+    // Cloning (vs mutating process.env) keeps concurrent calls isolated.
+    const childEnv = { ...process.env }
+    if (opts.tmuxTarget) childEnv.RELAY_TMUX_TARGET = opts.tmuxTarget
 
     return new Promise((resolve) => {
       const child = spawn(cmd, {
