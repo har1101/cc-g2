@@ -19,11 +19,13 @@ import { bootstrap as persistenceBootstrap, buildPaths } from './state/persisten
 import {
   addNotification as notificationServiceAdd,
   forwardReplyIfConfigured,
+  processReply as notificationServiceProcessReply,
 } from './services/notification-service.mjs'
 import {
   cleanupApprovalsOnStop as approvalServiceCleanupOnStop,
   createApproval as approvalServiceCreate,
   markApprovalCleanup as approvalServiceMarkCleanup,
+  matchPendingApprovalForReply as approvalServiceMatchForReply,
   resolveApproval as approvalServiceResolve,
 } from './services/approval-service.mjs'
 import { createTmuxRelay } from './transport/tmux-relay.mjs'
@@ -90,6 +92,15 @@ const relayReplyIfConfigured = createTmuxRelay({
   allowedSources: config.hubReplyRelaySources,
 })
 
+const processReply = (input) =>
+  notificationServiceProcessReply(input, {
+    matchPendingApprovalForReply: approvalServiceMatchForReply,
+    resolveApproval,
+    forwardReplyIfConfigured,
+    relayReplyIfConfigured,
+    repliesFile,
+  })
+
 // macOS-only desktop heads-up. Routes that need it call deps.spawnLocalNotification.
 function spawnLocalNotification(toolName) {
   try {
@@ -134,6 +145,7 @@ const deps = {
   markApprovalCleanup,
   forwardReplyIfConfigured,
   relayReplyIfConfigured,
+  processReply,
   spawnLocalNotification,
 }
 

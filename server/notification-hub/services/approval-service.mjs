@@ -186,3 +186,70 @@ export function getApprovalByNotificationId(notificationId) {
 export function listPendingApprovals() {
   return store.approvals.filter((a) => a.status === 'pending')
 }
+
+/**
+ * Find a pending approval whose tool/file/command best matches the reply
+ * notification. Used as a fallback when the reply notification does not
+ * carry an explicit approvalId link.
+ *
+ * Behavior preserved from the previous in-route implementation:
+ *   - Same toolName is required for a match (when reply has a toolName).
+ *   - Prefer the most recent pending approval whose linked notification
+ *     mentions the same file_path / command identifier.
+ *   - Otherwise fall back to the most recent pending approval with the
+ *     same toolName.
+ *
+ * @param {{ replyText: string, notification: import('../state/store.mjs').NotificationItem }} params
+ * @returns {import('../state/store.mjs').ApprovalRecord | null}
+ */
+export function matchPendingApprovalForReply({ notification }) {
+  const replyToolName = (notification?.metadata && notification.metadata.toolName) || ''
+  const replyTitle = notification?.title || ''
+  const replySummary = notification?.summary || ''
+  const replyFullText = notification?.fullText || ''
+
+  let bestMatch = null
+  for (let i = store.approvals.length - 1; i >= 0; i--) {
+    if (store.approvals[i].status !== 'pending') continue
+
+    // Same toolName is required for a match
+    if (replyToolName && store.approvals[i].toolName !== replyToolName) continue
+
+    // Try to match by file path or command content
+    const approvalNotif = store.notificationsById.get(store.approvals[i].notificationId)
+    if (approvalNotif && replyToolName) {
+      const input = store.approvals[i].toolInput || {}
+      const filePath = input.file_path || ''
+      const command = input.command || ''
+      const identifier = filePath || command
+
+      // Check if the reply notification mentions the same file/command
+      if (identifier) {
+        const shortId = identifier.split('/').pop() || identifier.slice(0, 30)
+        if (replyTitle.includes(shortId) || replySummary.includes(shortId) || replyFullText.includes(shortId)) {
+          bestMatch = store.approvals[i]
+          break
+        }
+      }
+    }
+
+    // If no content match found yet, keep as fallback (most recent pending with same toolName)
+    if (!bestMatch) {
+      bestMatch = store.approvals[i]
+    }
+  }
+  return bestMatch
+}
+
+/**
+ * Cleanup hook used by the long-poll route on requester disconnect.
+ * Marks the approval as cleaned-up if it is still pending.
+ *
+ * @param {string} approvalId
+ * @param {{ approvalsFile: string, persistToolInput: boolean }} cfg
+ */
+export function cleanupOnRequesterDisconnect(approvalId, cfg) {
+  const record = store.approvalsById.get(approvalId)
+  if (!record || record.status !== 'pending') return null
+  return markApprovalCleanup(record, 'terminal-disconnect', 'terminal', new Date().toISOString(), cfg)
+}
