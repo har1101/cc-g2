@@ -351,10 +351,18 @@ async function forwardReplyIfConfigured(record) {
   }
 }
 
-async function relayReplyIfConfigured(payload) {
+async function relayReplyIfConfigured(payload, opts = {}) {
   if (!hubReplyRelayCmd) return { status: 'stubbed' }
   const source = payload?.reply?.source || ''
-  if (hubReplyRelaySources.size > 0 && source && !hubReplyRelaySources.has(source)) {
+  // /api/v1/command 経路はリレー専用エンドポイントなので bypassSourceFilter:true を渡し、
+  // HUB_REPLY_RELAY_SOURCES に source が無くてもリレーするようにする。
+  // 既存の reply 経路（一引数呼び出し）は従来通り allowlist を尊重する。
+  if (
+    !opts.bypassSourceFilter &&
+    hubReplyRelaySources.size > 0 &&
+    source &&
+    !hubReplyRelaySources.has(source)
+  ) {
     return { status: 'stubbed' }
   }
 
@@ -1394,7 +1402,19 @@ const handler = async (req, res) => {
     if (typeof p.text !== 'string') {
       return sendJson(res, 400, { ok: false, error: 'text is required' })
     }
-    const sanitizedText = p.text.replace(/[\x00-\x08\x0B-\x1F\x7F]/g, '').trim()
+    // 入力をターミナル/ログに渡しても安全になるよう以下を行う:
+    // 1) NFC 正規化で結合文字列を canonical 化（日本語・絵文字は破壊しない）
+    // 2) C0(\n,\t は除外) + DEL + C1 を除去
+    // 3) ZWSP/ZWNJ/ZWJ/BOM を除去（不可視文字でのスプーフィング対策）
+    // 4) BiDi 上書き（U+202A-U+202E, U+2066-U+2069）を除去
+    // 5) Line/Paragraph Separator (U+2028/U+2029) を除去
+    const sanitizedText = String(p.text)
+      .normalize('NFC')
+      .replace(/[\x00-\x08\x0B-\x1F\x7F-\x9F]/gu, '')
+      .replace(/[\u{200B}-\u{200D}\u{FEFF}]/gu, '')
+      .replace(/[\u{202A}-\u{202E}\u{2066}-\u{2069}]/gu, '')
+      .replace(/[\u{2028}\u{2029}]/gu, '')
+      .trim()
     if (!sanitizedText) {
       return sendJson(res, 400, { ok: false, error: 'text is required' })
     }
@@ -1448,7 +1468,10 @@ const handler = async (req, res) => {
 
     let relay
     try {
-      relay = await relayReplyIfConfigured({ reply, notification })
+      // /api/v1/command はリレー専用エンドポイントなので、HUB_REPLY_RELAY_SOURCES に
+      // g2_voice / g2_text が無くても必ずリレーする (operator が legacy 'g2,web' のままでも
+      // voice command が silently 'stubbed' にならないようにする)
+      relay = await relayReplyIfConfigured({ reply, notification }, { bypassSourceFilter: true })
       if (relay.status === 'forwarded') reply.status = 'forwarded'
       else if (relay.status === 'failed') reply.status = 'failed'
       else reply.status = 'stubbed'

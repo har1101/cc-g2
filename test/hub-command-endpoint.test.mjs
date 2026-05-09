@@ -193,6 +193,52 @@ describe('Notification Hub — POST /api/v1/command', () => {
     expect(match.summary).toContain('helloworld\nfoo\tbar')
   })
 
+  it('strips zero-width / BiDi / C1 controls / BOM and preserves Japanese + emoji (NFC)', async () => {
+    // U+200B ZWSP, U+200C ZWNJ, U+200D ZWJ, U+FEFF BOM,
+    // U+202E RLO, U+2066 LRI, U+0080 / U+009F (C1), U+2028 LSEP, U+2029 PSEP
+    const marker = `zw-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    const text =
+      `${marker}` +
+      '​‌‍﻿' + // zero-width family
+      '‮⁦⁩' +       // BiDi overrides
+      '' +              // C1 controls
+      '  ' +              // line / paragraph separator
+      'こんにちは' +                  // Japanese
+      '🎉'                 // emoji 🎉
+    const { status, data } = await postJson(hub.base, '/api/v1/command', {
+      source: 'g2_voice',
+      text,
+    })
+    expect(status).toBe(200)
+    expect(data.ok).toBe(true)
+
+    const { data: notifs } = await getJson(hub.base, '/api/notifications?limit=100')
+    const match = notifs.items.find(
+      (n) => typeof n.summary === 'string' && n.summary.includes(marker),
+    )
+    expect(match).toBeDefined()
+    // Pull full record via detail endpoint to assert on fullText.
+    const detailRes = await fetch(`${hub.base}/api/notifications/${match.id}`, {
+      headers: { 'X-CC-G2-Token': TEST_HUB_TOKEN },
+    })
+    expect(detailRes.status).toBe(200)
+    const detail = await detailRes.json()
+    const stored = detail.item.fullText
+    expect(typeof stored).toBe('string')
+    // Stripped chars must NOT appear anywhere in the persisted text
+    for (const ch of [
+      '​', '‌', '‍', '﻿',
+      '‮', '⁦', '⁩',
+      '', '',
+      ' ', ' ',
+    ]) {
+      expect(stored).not.toContain(ch)
+    }
+    // Japanese + emoji preserved (NFC normalization doesn't break them)
+    expect(stored).toContain('こんにちは')
+    expect(stored).toContain('🎉')
+  })
+
   it('returns 400 on invalid tmux_target shape', async () => {
     const { status, data } = await postJson(hub.base, '/api/v1/command', {
       source: 'g2_voice',
@@ -288,5 +334,72 @@ exit 0
     expect(captured).not.toContain('\x01')
     expect(captured).toContain('"hookType":"g2-command"')
     expect(captured).toContain('"source":"g2_voice"')
+  })
+})
+
+describe('Notification Hub — POST /api/v1/command bypasses HUB_REPLY_RELAY_SOURCES allowlist', () => {
+  /** @type {{proc:any, base:string, dataDir:string, port:number}} */
+  let hub
+  /** @type {string} */
+  let captureFile = ''
+  /** @type {string} */
+  let scriptDir = ''
+
+  beforeAll(async () => {
+    scriptDir = await mkdtemp(path.join(tmpdir(), 'hub-cmd-bypass-'))
+    captureFile = path.join(scriptDir, 'relay-stdin.log')
+    const relayScript = path.join(scriptDir, 'capture-relay.sh')
+    await writeFile(
+      relayScript,
+      `#!/bin/sh
+cat >> ${JSON.stringify(captureFile)}
+printf '\\n---\\n' >> ${JSON.stringify(captureFile)}
+exit 0
+`,
+      'utf8',
+    )
+    await chmod(relayScript, 0o755)
+    // Allowlist intentionally OMITS g2_voice — only g2,web. The /api/v1/command
+    // route must still relay (bypassSourceFilter:true), proving operators with
+    // legacy allowlists won't silently stub voice commands.
+    hub = await startHub({
+      env: {
+        HUB_REPLY_RELAY_CMD: relayScript,
+        HUB_REPLY_RELAY_SOURCES: 'g2,web',
+      },
+    })
+  }, 15000)
+
+  afterAll(async () => {
+    await stopHub(hub)
+    if (scriptDir) await rm(scriptDir, { recursive: true, force: true }).catch(() => {})
+  })
+
+  it('relays g2_voice even when the allowlist excludes g2_voice', async () => {
+    const marker = `bypass-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    const { status, data } = await postJson(hub.base, '/api/v1/command', {
+      source: 'g2_voice',
+      text: `${marker} hello`,
+    })
+    expect(status).toBe(200)
+    expect(data.ok).toBe(true)
+
+    const deadline = Date.now() + 4000
+    let captured = ''
+    while (Date.now() < deadline) {
+      try {
+        captured = await readFile(captureFile, 'utf8')
+      } catch {
+        captured = ''
+      }
+      if (captured.includes('---')) break
+      await new Promise((r) => setTimeout(r, 50))
+    }
+    // Capture file must contain the marker — proves the relay actually executed
+    // rather than being silently 'stubbed' by the source allowlist.
+    expect(captured).toContain(marker)
+    expect(captured).toContain('"source":"g2_voice"')
+    // Forwarded responses omit the relay field; 'stubbed' would set relay='stubbed'.
+    expect(data.relay).toBeUndefined()
   })
 })

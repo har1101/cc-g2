@@ -126,6 +126,10 @@ let voiceCommandRecordingMaxTimer: ReturnType<typeof setTimeout> | null = null
 let voiceCommandDoneTimer: ReturnType<typeof setTimeout> | null = null
 // 送信中にユーザーが double-tap で強制 idle 復帰した場合に true。await 後の画面遷移で参照する
 let voiceCommandSendCancelled = false
+// 各ボイスコマンドフローに割り振る世代トークン。await 跨ぎでキャンセル/リスタートを検知するため、
+// start/cancel で increment し、stop/send は entry 時にキャプチャして await 後に再確認する。
+let voiceCommandGeneration = 0
+let voiceCommandStartInFlight = false
 let lastIdleEventAt = 0
 let idleTapDuringRender = false
 let idleOpenBlockedUntil = 0
@@ -833,30 +837,65 @@ function clearVoiceCommandDoneTimer() {
   }
 }
 
-async function startVoiceCommandRecording() {
-  if (!connection) return
+function resetVoiceCommandStateToIdle() {
+  voiceCommandIsRecording = false
+  voiceCommandStopInFlight = false
   voiceCommandAudioChunks = []
   voiceCommandAudioTotalBytes = 0
   voiceCommandFinalText = ''
-  voiceCommandStopInFlight = false
-  voiceCommandStartedAt = Date.now()
-  voiceCommandIsRecording = true
-  notifState.screen = 'voice-command-recording'
-
-  await glassesUI.showVoiceCommandRecording(connection, { bytes: 0 })
-  // simulator 互換: audioControl 前にベースページが必要
-  if (connection.mode === 'bridge' && !glassesUI.hasRenderedPage(connection)) {
-    await glassesUI.ensureBasePage(connection, '音声コマンド録音中...')
-  }
-  await connection.startAudio()
-
   clearVoiceCommandRecordingMaxTimer()
-  voiceCommandRecordingMaxTimer = setTimeout(() => {
-    void stopVoiceCommandRecording('timeout')
-  }, VOICE_COMMAND_RECORDING_MAX_MS)
+  clearVoiceCommandDoneTimer()
+}
 
-  updateNotifInfo()
-  log('voice-command: 録音開始 (single tap)')
+async function startVoiceCommandRecording() {
+  if (!connection) return
+  if (voiceCommandStartInFlight) {
+    log('voice-command: 重複開始イベントを無視 (start-in-flight)')
+    return
+  }
+  voiceCommandStartInFlight = true
+  // start のたびに世代を 1 つ進める。stop/send 側はこの値をキャプチャしておき、
+  // await 後にグローバルが進んでいたら（=cancel または再 start 済み）状態を上書きしない。
+  const gen = ++voiceCommandGeneration
+  try {
+    voiceCommandAudioChunks = []
+    voiceCommandAudioTotalBytes = 0
+    voiceCommandFinalText = ''
+    voiceCommandStopInFlight = false
+    voiceCommandStartedAt = Date.now()
+    voiceCommandIsRecording = true
+    notifState.screen = 'voice-command-recording'
+
+    await glassesUI.showVoiceCommandRecording(connection, { bytes: 0 })
+    // simulator 互換: audioControl 前にベースページが必要
+    if (connection.mode === 'bridge' && !glassesUI.hasRenderedPage(connection)) {
+      await glassesUI.ensureBasePage(connection, '音声コマンド録音中...')
+    }
+    await connection.startAudio()
+
+    clearVoiceCommandRecordingMaxTimer()
+    voiceCommandRecordingMaxTimer = setTimeout(() => {
+      void stopVoiceCommandRecording('timeout')
+    }, VOICE_COMMAND_RECORDING_MAX_MS)
+
+    updateNotifInfo()
+    log(`voice-command: 録音開始 (single tap) gen=${gen}`)
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    log(`voice command: 録音開始失敗 ${msg}`)
+    // 録音開始の途中失敗は state を必ず idle に戻す。世代も進めて、もし stopAudio など
+    // 既にスケジュール済みのコールバックが返ってきても無視されるようにする。
+    resetVoiceCommandStateToIdle()
+    voiceCommandGeneration++
+    try {
+      await returnToIdleFromVoiceCommand('start-failed')
+    } catch (idleErr) {
+      log(`voice-command: idle 復帰失敗 ${idleErr instanceof Error ? idleErr.message : String(idleErr)}`)
+      notifState.screen = 'idle'
+    }
+  } finally {
+    voiceCommandStartInFlight = false
+  }
 }
 
 async function stopVoiceCommandRecording(reason: string) {
@@ -865,17 +904,36 @@ async function stopVoiceCommandRecording(reason: string) {
     log(`voice-command: 重複停止イベントを無視 reason=${reason}`)
     return
   }
+  // entry 時に現世代をキャプチャ。各 await 後にこの値が陳腐化していないか確認することで、
+  // ユーザーが double-tap でキャンセルした流れと競合した時の上書きを防ぐ。
+  const gen = voiceCommandGeneration
   voiceCommandStopInFlight = true
   clearVoiceCommandRecordingMaxTimer()
+
+  const isStillCurrent = () => {
+    if (voiceCommandGeneration !== gen) return false
+    // start/stop/confirm 以外の画面に遷移していたらキャンセル済み（idle など）。
+    if (
+      notifState.screen !== 'voice-command-recording' &&
+      notifState.screen !== 'voice-command-confirm'
+    ) {
+      return false
+    }
+    return true
+  }
 
   try {
     if (voiceCommandIsRecording) {
       voiceCommandIsRecording = false
       await connection.stopAudio()
     }
+    if (!isStillCurrent()) {
+      log(`voice-command: stop result discarded (cancelled) reason=${reason} stage=stopAudio`)
+      return
+    }
 
     const elapsedMs = Date.now() - voiceCommandStartedAt
-    log(`voice-command: 停止 reason=${reason} elapsed=${elapsedMs}ms bytes=${voiceCommandAudioTotalBytes}`)
+    log(`voice-command: 停止 reason=${reason} gen=${gen} elapsed=${elapsedMs}ms bytes=${voiceCommandAudioTotalBytes}`)
 
     if (voiceCommandAudioTotalBytes === 0) {
       log('voice-command: 録音内容なし → idle')
@@ -886,6 +944,10 @@ async function stopVoiceCommandRecording(reason: string) {
     const chunks = voiceCommandAudioChunks
     try {
       const stt = await transcribePcmChunks(chunks)
+      if (!isStillCurrent()) {
+        log(`voice-command: stop result discarded (cancelled) reason=${reason} stage=stt`)
+        return
+      }
       const text = (stt.text ?? '').trim()
       log(`voice-command STT完了: provider=${stt.provider} text="${text}"`)
 
@@ -898,12 +960,24 @@ async function stopVoiceCommandRecording(reason: string) {
       voiceCommandFinalText = text
       notifState.screen = 'voice-command-confirm'
       await glassesUI.showVoiceCommandConfirm(connection, text)
+      if (!isStillCurrent()) {
+        log(`voice-command: stop result discarded (cancelled) reason=${reason} stage=confirm-render`)
+        return
+      }
       updateNotifInfo()
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       log(`voice-command STT失敗: ${msg}`)
+      if (voiceCommandGeneration !== gen) {
+        log('voice-command: STT失敗の表示をキャンセル (gen mismatch)')
+        return
+      }
       notifState.screen = 'voice-command-done'
       await glassesUI.showVoiceCommandDone(connection, false)
+      if (voiceCommandGeneration !== gen) {
+        log('voice-command: STT失敗の表示後 gen mismatch → idle 維持')
+        return
+      }
       updateNotifInfo()
       scheduleVoiceCommandDoneReturn()
     }
@@ -914,6 +988,8 @@ async function stopVoiceCommandRecording(reason: string) {
 
 async function cancelVoiceCommandRecording(reason: string) {
   if (!connection) return
+  // 進行中の stop / send が await 後に状態を上書きできないよう世代を進める。
+  voiceCommandGeneration++
   clearVoiceCommandRecordingMaxTimer()
   if (voiceCommandIsRecording) {
     voiceCommandIsRecording = false
@@ -954,10 +1030,17 @@ async function sendVoiceCommandAndShowResult() {
     await returnToIdleFromVoiceCommand('empty-text-send')
     return
   }
+  // entry 時に世代をキャプチャ。voiceCommandSendCancelled も併用するが、こちらは
+  // 全キャンセル経路（cancel/start 再起動）を網羅する一般化されたガード。
+  const gen = voiceCommandGeneration
   // 新規送信開始時にキャンセルフラグをリセット
   voiceCommandSendCancelled = false
   notifState.screen = 'voice-command-sending'
   await glassesUI.showVoiceCommandSending(connection)
+  if (voiceCommandGeneration !== gen) {
+    log('voice-command: send result discarded (cancelled) stage=sending-render')
+    return
+  }
   updateNotifInfo()
 
   let ok = false
@@ -972,13 +1055,21 @@ async function sendVoiceCommandAndShowResult() {
   }
 
   // await 中にユーザーが double-tap で強制 idle 復帰していたら結果画面をスキップ
-  if (notifState.screen !== 'voice-command-sending' || voiceCommandSendCancelled) {
+  if (
+    voiceCommandGeneration !== gen ||
+    notifState.screen !== 'voice-command-sending' ||
+    voiceCommandSendCancelled
+  ) {
     log('voice-command: send result discarded (user cancelled)')
     return
   }
 
   notifState.screen = 'voice-command-done'
   await glassesUI.showVoiceCommandDone(connection, ok)
+  if (voiceCommandGeneration !== gen) {
+    log('voice-command: done render後 gen mismatch → 自動復帰スキップ')
+    return
+  }
   updateNotifInfo()
   scheduleVoiceCommandDoneReturn()
 }
@@ -1605,6 +1696,7 @@ async function handleNotifEvent(conn: BridgeConnection, event: EvenHubEvent) {
       } else if (notifState.screen === 'voice-command-confirm') {
         if (isDoubleTapEventType(eventType)) {
           log('voice-command: 確認画面 → キャンセル')
+          voiceCommandGeneration++
           voiceCommandFinalText = ''
           await returnToIdleFromVoiceCommand('user-cancel-confirm')
           return
@@ -1620,6 +1712,7 @@ async function handleNotifEvent(conn: BridgeConnection, event: EvenHubEvent) {
           log('voice-command: 送信中に double tap → 強制 idle 復帰')
           cancelPendingIdleSingleTap()
           voiceCommandSendCancelled = true
+          voiceCommandGeneration++
           await returnToIdleFromVoiceCommand('user-cancel-during-send')
           return
         }
