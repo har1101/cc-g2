@@ -188,6 +188,7 @@ function buildScreenContext(): ScreenContext {
   if (!audioSession) throw new Error('buildScreenContext called without audioSession')
   return {
     conn: connection,
+    getConnection: () => connection,
     glassesUI,
     store,
     notifClient,

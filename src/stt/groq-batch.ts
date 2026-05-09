@@ -20,7 +20,10 @@ export type SttResult = {
   model?: string
 }
 
-export async function transcribePcmChunks(chunks: Uint8Array[]): Promise<SttResult> {
+export async function transcribePcmChunks(
+  chunks: Uint8Array[],
+  opts: { signal?: AbortSignal } = {},
+): Promise<SttResult> {
   if (appConfig.sttForceError) {
     throw new Error('Forced STT error (VITE_STT_FORCE_ERROR=true)')
   }
@@ -42,10 +45,13 @@ export async function transcribePcmChunks(chunks: Uint8Array[]): Promise<SttResu
   }
 
   const wav = encodePcm16kMonoS16leToWav(pcm)
-  return transcribeWavWithGroq(wav)
+  return transcribeWavWithGroq(wav, { signal: opts.signal })
 }
 
-async function transcribeWavWithGroq(wavBytes: Uint8Array): Promise<SttResult> {
+async function transcribeWavWithGroq(
+  wavBytes: Uint8Array,
+  opts: { signal?: AbortSignal } = {},
+): Promise<SttResult> {
   const audioBase64 = bytesToBase64(wavBytes)
   const res = await fetch(`${appConfig.notificationHubUrl}/api/stt/transcriptions`, {
     method: 'POST',
@@ -57,6 +63,7 @@ async function transcribeWavWithGroq(wavBytes: Uint8Array): Promise<SttResult> {
       language: 'ja',
       response_format: 'verbose_json',
     }),
+    signal: opts.signal,
   })
 
   if (!res.ok) {
@@ -111,6 +118,7 @@ export function createGroqBatchEngine(): SttEngine {
       let cancelled = false
       let finalized = false
       const startedAt = Date.now()
+      const abortController = new AbortController()
 
       const session: SttSession = {
         voiceSessionId,
@@ -124,7 +132,7 @@ export function createGroqBatchEngine(): SttEngine {
             return { text: '', provider: kind }
           }
           finalized = true
-          const result = await transcribePcmChunks(chunks)
+          const result = await transcribePcmChunks(chunks, { signal: abortController.signal })
           const elapsed = Date.now() - startedAt
           return {
             text: result.text,
@@ -135,9 +143,12 @@ export function createGroqBatchEngine(): SttEngine {
           }
         },
         async cancel() {
-          if (finalized || cancelled) return
+          if (cancelled) return
           cancelled = true
           chunks.length = 0
+          // finalize の最中なら fetch を中断する (Codex 1.5c 指摘 #4 対応)。
+          // finalize 前ならこの abort は no-op (まだ in-flight の request がない)。
+          abortController.abort()
         },
         // batch engine では partial / error は emit しないが、 caller の
         // 配線を簡潔にするため interface 上は subscribe を受け取れるようにする。

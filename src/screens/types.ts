@@ -26,8 +26,14 @@ export type GlassesUI = ReturnType<typeof createGlassesUI>
 export type Screen = NotificationUIState['screen']
 
 export type ScreenContext = {
-  /** 現在の bridge 接続 */
+  /** イベント受信時点の bridge 接続 (event handler 内で同期的に使う場合のみ) */
   conn: BridgeConnection
+  /**
+   * 現在の bridge 接続を取得する live accessor。 setTimeout / await 後など
+   * 「再接続でハンドルが差し替わる」 可能性がある箇所では `conn` ではなく
+   * これを使う。 切断中なら null を返す。
+   */
+  getConnection(): BridgeConnection | null
   /** glasses 描画 facade */
   glassesUI: GlassesUI
   /** central state store (notif / reply / voice / dashboard / ...) */

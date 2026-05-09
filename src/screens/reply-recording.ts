@@ -86,10 +86,13 @@ export async function handle(event: NormalizedG2Event, ctx: ScreenContext): Prom
       const msg = err instanceof Error ? err.message : String(err)
       log(`返信STT失敗: ${msg}`)
       await glassesUI.showReplyResult(conn, false, msg)
-      // 3秒後に前画面に戻る
+      // 3秒後に前画面に戻る。 タイマー発火時点で再接続でハンドルが差し替わって
+      // いる可能性があるので、 captured `ctx.conn` ではなく live accessor を使う。
       setTimeout(async () => {
-        if (store.notif.detailItem && ctx.conn) {
-          await returnToPrePreviousScreen(ctx)
+        const liveConn = ctx.getConnection()
+        if (store.notif.detailItem && liveConn) {
+          // ctx を作り直す代わりに、 helper を使って prev-screen 復帰だけを再構成。
+          await returnToPrePreviousScreen({ ...ctx, conn: liveConn })
         }
         ctx.updateNotifInfo()
         store.reply.stopInFlight = false
