@@ -61,6 +61,7 @@ import {
   resolveApproval as approvalServiceResolve,
 } from './services/approval-service.mjs'
 import { processCommand as commandServiceProcess } from './services/command-service.mjs'
+import { createTmuxRelay } from './transport/tmux-relay.mjs'
 
 const legacyHubBind = process.env.HUB_BIND
 const bindModeRaw = process.env.HUB_BIND_MODE
@@ -179,69 +180,11 @@ function markApprovalCleanup(record, resolution, decidedBy, decidedAt) {
   return approvalServiceMarkCleanup(record, resolution, decidedBy, decidedAt, approvalCfg())
 }
 
-async function relayReplyIfConfigured(payload, opts = {}) {
-  if (!hubReplyRelayCmd) return { status: 'stubbed' }
-  const source = payload?.reply?.source || ''
-  // /api/v1/command 経路はリレー専用エンドポイントなので bypassSourceFilter:true を渡し、
-  // HUB_REPLY_RELAY_SOURCES に source が無くてもリレーするようにする。
-  // 既存の reply 経路（一引数呼び出し）は従来通り allowlist を尊重する。
-  if (
-    !opts.bypassSourceFilter &&
-    hubReplyRelaySources.size > 0 &&
-    source &&
-    !hubReplyRelaySources.has(source)
-  ) {
-    return { status: 'stubbed' }
-  }
-
-  return new Promise((resolve) => {
-    const child = spawn(hubReplyRelayCmd, {
-      shell: true,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: process.env,
-    })
-
-    let stdout = ''
-    let stderr = ''
-    const maxCapture = 2000
-    let settled = false
-
-    const finish = (result) => {
-      if (settled) return
-      settled = true
-      resolve(result)
-    }
-
-    const timer = setTimeout(() => {
-      child.kill('SIGTERM')
-      finish({ status: 'failed', error: `relay timeout ${hubReplyRelayTimeoutMs}ms` })
-    }, hubReplyRelayTimeoutMs)
-
-    child.on('error', (err) => {
-      clearTimeout(timer)
-      finish({ status: 'failed', error: err instanceof Error ? err.message : String(err) })
-    })
-
-    child.stdout.on('data', (chunk) => {
-      if (stdout.length < maxCapture) stdout += String(chunk)
-    })
-    child.stderr.on('data', (chunk) => {
-      if (stderr.length < maxCapture) stderr += String(chunk)
-    })
-
-    child.on('close', (code) => {
-      clearTimeout(timer)
-      if (code === 0) {
-        return finish({ status: 'forwarded' })
-      }
-      const msg = (stderr || stdout || '').trim()
-      return finish({ status: 'failed', error: `relay exit=${code}${msg ? ` ${msg}` : ''}` })
-    })
-
-    child.stdin.write(JSON.stringify(payload))
-    child.stdin.end()
-  })
-}
+const relayReplyIfConfigured = createTmuxRelay({
+  cmd: hubReplyRelayCmd,
+  timeoutMs: hubReplyRelayTimeoutMs,
+  allowedSources: hubReplyRelaySources,
+})
 
 function matchApprovalPath(pathname) {
   const m = pathname.match(/^\/api\/approvals\/([^/]+)$/)
