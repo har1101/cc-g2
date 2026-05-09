@@ -49,6 +49,7 @@ function makeFakeAudioSession() {
 type FakeSession = SttSession & {
   emitPartial(p: SttPartialResult): void
   emitFinal(text: string, opts?: { confidence?: number }): void
+  emitLateFinal(text: string, opts?: { confidence?: number }): void
   emitError(code: string, message: string): void
   finalizeCalled: () => boolean
   cancelCalled: () => boolean
@@ -61,6 +62,7 @@ function makeFakeStreamEngine(opts: { finalizeMode?: 'auto-stable' | 'manual' } 
     async start({ voiceSessionId }) {
       const partialHandlers: Array<(p: SttPartialResult) => void> = []
       const errorHandlers: Array<(e: { code: string; message: string }) => void> = []
+      const lateFinalHandlers: Array<(r: { text: string; confidence?: number; provider: 'deepgram-stream' }) => void> = []
       let stableText = ''
       let finalized = false
       let cancelled = false
@@ -89,9 +91,13 @@ function makeFakeStreamEngine(opts: { finalizeMode?: 'auto-stable' | 'manual' } 
           // default: return current stable_text
           return { text: stableText, provider: 'deepgram-stream' }
         },
-        async cancel() { cancelled = true },
+        async cancel() {
+          cancelled = true
+          lateFinalHandlers.length = 0
+        },
         onPartial(handler) { partialHandlers.push(handler) },
         onError(handler) { errorHandlers.push(handler) },
+        onLateFinal(handler) { lateFinalHandlers.push(handler) },
         emitPartial(p) {
           stableText = p.stable_text
           for (const h of partialHandlers) h(p)
@@ -99,6 +105,9 @@ function makeFakeStreamEngine(opts: { finalizeMode?: 'auto-stable' | 'manual' } 
         emitFinal(text, o) {
           pendingFinal = { text, confidence: o?.confidence }
           stableText = text
+        },
+        emitLateFinal(text, o) {
+          for (const h of lateFinalHandlers) h({ text, confidence: o?.confidence, provider: 'deepgram-stream' })
         },
         emitError(code, message) {
           for (const h of errorHandlers) h({ code, message })
@@ -267,5 +276,34 @@ describe('voice-command-recording-streaming', () => {
     // Per spec: 未確定 partial_text は確定として使わない
     expect(store.voice.finalText).toBe('今日は')
     expect(env.glassesUI.showVoiceCommandConfirm).toHaveBeenCalledWith(expect.anything(), '今日は')
+  })
+
+  it('late-final updates finalText when still on confirm screen and not sending', async () => {
+    const env = setupHelpers()
+    await startVoiceCommandRecording()
+    const session = env.engine.lastSession()!
+    session.emitPartial({ stable_text: '途中の文字', partial_text: '', stable_seq: 1, partial_seq: 1 })
+    await finalizeVoiceCommandStreaming('user-tap')
+    expect(store.voice.finalText).toBe('途中の文字')
+    // simulate late stt.final delivered post-timeout
+    session.emitLateFinal('完全な文字列です')
+    expect(store.voice.finalText).toBe('完全な文字列です')
+    // showVoiceCommandConfirm called with the late text + (updated) badge
+    const calls = (env.glassesUI.showVoiceCommandConfirm as any).mock.calls
+    const last = calls[calls.length - 1]
+    expect(last[1]).toContain('完全な文字列です')
+    expect(last[1]).toContain('(updated)')
+  })
+
+  it('late-final is dropped after sendOrCancelInProgress is set', async () => {
+    const env = setupHelpers()
+    await startVoiceCommandRecording()
+    const session = env.engine.lastSession()!
+    session.emitPartial({ stable_text: 'A', partial_text: '', stable_seq: 1, partial_seq: 1 })
+    await finalizeVoiceCommandStreaming('user-tap')
+    // simulate user pressing Send
+    store.voice.sendOrCancelInProgress = true
+    session.emitLateFinal('B-late')
+    expect(store.voice.finalText).toBe('A')
   })
 })

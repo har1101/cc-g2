@@ -15,7 +15,13 @@ export async function handle(event: NormalizedG2Event, ctx: ScreenContext): Prom
   if (isDoubleTapEventType(eventType)) {
     ctx.log('voice-command: 確認画面 → キャンセル')
     bumpVoiceGeneration()
+    // Phase 2 Pass 5: late-final が届いても無視する。
+    ctx.store.voice.sendOrCancelInProgress = true
     ctx.store.voice.finalText = ''
+    if (ctx.store.voice.lateFinalUpdatedTimer) {
+      clearTimeout(ctx.store.voice.lateFinalUpdatedTimer)
+      ctx.store.voice.lateFinalUpdatedTimer = null
+    }
     await ctx.returnToIdleFromVoiceCommand('user-cancel-confirm')
     return
   }

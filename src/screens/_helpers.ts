@@ -466,6 +466,43 @@ async function startVoiceCommandRecordingStreaming(): Promise<void> {
         d.log(`voice-command-streaming: engine error code=${err.code} msg=${err.message}`)
       })
     }
+    // Phase 2 Pass 5: late-final handling.
+    // - 800ms タイムアウト後に届いた stt.final の本文に差し替える (confirm画面で送信前のみ)。
+    // - 送信中 / キャンセル後は破棄する。
+    if (typeof session.onLateFinal === 'function') {
+      session.onLateFinal((late) => {
+        if (store.voice.generation !== gen) return
+        if (store.voice.sendOrCancelInProgress) {
+          d.log('voice-command-streaming: late-final 破棄 (send/cancel 進行中)')
+          return
+        }
+        if (store.notif.screen !== 'voice-command-confirm') {
+          d.log(`voice-command-streaming: late-final 破棄 (screen=${store.notif.screen})`)
+          return
+        }
+        const lateText = (late.text ?? '').trim()
+        if (!lateText) return
+        if (lateText === store.voice.preFinalText) {
+          d.log('voice-command-streaming: late-final は preFinalText と同一 → no-op')
+          return
+        }
+        d.log(`voice-command-streaming: late-final 適用 "${store.voice.preFinalText}" → "${lateText}"`)
+        store.voice.finalText = lateText
+        const liveConn = d.getConnection()
+        if (liveConn) {
+          void d.glassesUI.showVoiceCommandConfirm(liveConn, `${lateText}\n(updated)`)
+          // 1 秒後に通常表示に戻す。
+          if (store.voice.lateFinalUpdatedTimer) clearTimeout(store.voice.lateFinalUpdatedTimer)
+          store.voice.lateFinalUpdatedTimer = setTimeout(() => {
+            store.voice.lateFinalUpdatedTimer = null
+            if (store.voice.generation !== gen) return
+            if (store.notif.screen !== 'voice-command-confirm') return
+            const conn2 = d.getConnection()
+            if (conn2) void d.glassesUI.showVoiceCommandConfirm(conn2, lateText)
+          }, 1000)
+        }
+      })
+    }
 
     currentVoiceAudioHandle.onPcm((pcm) => {
       if (!store.voice.isRecording) return
@@ -778,6 +815,13 @@ export async function sendVoiceCommandAndShowResult(): Promise<void> {
   const gen = store.voice.generation
   // 新規送信開始時にキャンセルフラグをリセット
   store.voice.sendCancelled = false
+  // Phase 2: 送信開始 → late-final が届いてもテキストを差し替えない。
+  store.voice.sendOrCancelInProgress = true
+  // late-final 用の (updated) バッジ復元タイマーをキャンセル
+  if (store.voice.lateFinalUpdatedTimer) {
+    clearTimeout(store.voice.lateFinalUpdatedTimer)
+    store.voice.lateFinalUpdatedTimer = null
+  }
   store.notif.screen = 'voice-command-sending'
   await d.glassesUI.showVoiceCommandSending(conn)
   if (store.voice.generation !== gen) {

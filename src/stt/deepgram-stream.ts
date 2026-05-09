@@ -114,9 +114,13 @@ export function createDeepgramStreamEngine(opts: DeepgramStreamEngineOptions = {
       const pendingBinary: ArrayBuffer[] = []
       const partialHandlers: Array<(p: SttPartialResult) => void> = []
       const errorHandlers: Array<(e: { code: string; message: string }) => void> = []
+      const lateFinalHandlers: Array<(r: SttFinalResult) => void> = []
       // resolve when stt.final arrives; reject on error/close mid-finalize
       let finalResolver: ((r: SttFinalResult) => void) | null = null
       let finalRejecter: ((e: Error) => void) | null = null
+      // True once finalize() has resolved (synthetic timeout or real final).
+      // Subsequent stt.final frames trigger onLateFinal instead.
+      let finalDelivered = false
 
       const startFrame = JSON.stringify({
         type: 'stt.start',
@@ -186,15 +190,30 @@ export function createDeepgramStreamEngine(opts: DeepgramStreamEngineOptions = {
             const resolver = finalResolver
             finalResolver = null
             finalRejecter = null
+            finalDelivered = true
             resolver({
               text: frame.text,
               confidence: frame.confidence,
               duration_ms: frame.duration_ms,
               provider: 'deepgram-stream',
             })
+          } else if (finalDelivered) {
+            // finalize() already resolved (timeout path) but the real final
+            // landed late. Record + notify subscribers.
+            lastStableText = frame.text
+            lastConfidence = frame.confidence
+            const lateResult: SttFinalResult = {
+              text: frame.text,
+              confidence: frame.confidence,
+              duration_ms: frame.duration_ms ?? (Date.now() - startedAt),
+              provider: 'deepgram-stream',
+            }
+            for (const h of lateFinalHandlers) {
+              try { h(lateResult) } catch { /* swallow */ }
+            }
           } else {
-            // Final arrived without a pending finalize() (or after timeout):
-            // record it so the caller's late-final handler can pick it up.
+            // Final arrived before finalize() was called. Record it so the
+            // next finalize() can use it.
             lastStableText = frame.text
             lastConfidence = frame.confidence
           }
@@ -296,7 +315,12 @@ export function createDeepgramStreamEngine(opts: DeepgramStreamEngineOptions = {
               })
             }, finalizeTimeoutMs)
           })
-          try { ws.close() } catch { /* ignore */ }
+          finalDelivered = true
+          // We DO NOT close the ws here on the timeout path: the Hub may still
+          // deliver a real stt.final that we want to surface to onLateFinal
+          // subscribers. Close is driven by the Hub closing after sending its
+          // own stt.final — the on('close') handler will tear down. Cancel/
+          // explicit subsequent finalize will still close immediately.
           return result
         },
         async cancel(): Promise<void> {
@@ -310,6 +334,8 @@ export function createDeepgramStreamEngine(opts: DeepgramStreamEngineOptions = {
           try { ws.close() } catch { /* ignore */ }
           partialHandlers.length = 0
           errorHandlers.length = 0
+          // late-final must NOT fire after cancel (per design §4.7.1)
+          lateFinalHandlers.length = 0
           if (finalResolver) {
             const resolver = finalResolver
             finalResolver = null
@@ -322,6 +348,9 @@ export function createDeepgramStreamEngine(opts: DeepgramStreamEngineOptions = {
         },
         onError(handler) {
           errorHandlers.push(handler)
+        },
+        onLateFinal(handler) {
+          lateFinalHandlers.push(handler)
         },
       }
       return session
