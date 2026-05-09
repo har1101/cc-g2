@@ -202,6 +202,34 @@ describe('Notification Hub — POST /api/v1/command', () => {
     expect(status).toBe(400)
     expect(data.error).toBe('invalid tmux_target')
   })
+
+  it('silently drops invalid transcript_confidence (out-of-range or wrong type)', async () => {
+    const marker1 = `tc-out-of-range-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    const r1 = await postJson(hub.base, '/api/v1/command', {
+      source: 'g2_voice',
+      text: marker1,
+      transcript_confidence: 1.5,
+    })
+    expect(r1.status).toBe(200)
+    expect(r1.data.ok).toBe(true)
+
+    const marker2 = `tc-wrong-type-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    const r2 = await postJson(hub.base, '/api/v1/command', {
+      source: 'g2_voice',
+      text: marker2,
+      transcript_confidence: 'abc',
+    })
+    expect(r2.status).toBe(200)
+    expect(r2.data.ok).toBe(true)
+
+    const { data: notifs } = await getJson(hub.base, '/api/notifications?limit=100')
+    const m1 = notifs.items.find((n) => typeof n.summary === 'string' && n.summary.includes(marker1))
+    const m2 = notifs.items.find((n) => typeof n.summary === 'string' && n.summary.includes(marker2))
+    expect(m1).toBeDefined()
+    expect(m2).toBeDefined()
+    expect(m1.metadata.transcriptConfidence).toBeUndefined()
+    expect(m2.metadata.transcriptConfidence).toBeUndefined()
+  })
 })
 
 describe('Notification Hub — POST /api/v1/command relay invocation', () => {
@@ -257,7 +285,7 @@ exit 0
     }
     expect(captured).toContain('voice command with')
     expect(captured).toContain('control chars')
-    expect(captured).not.toContain('')
+    expect(captured).not.toContain('\x01')
     expect(captured).toContain('"hookType":"g2-command"')
     expect(captured).toContain('"source":"g2_voice"')
   })

@@ -1444,15 +1444,35 @@ const handler = async (req, res) => {
 
     notifications.push(notification)
     notificationsById.set(notification.id, notification)
-    await appendJsonl(notificationsFile, notification)
+    await appendJsonl(notificationsFile, persistedNotification(notification, { persistRaw: hubPersistRaw }))
 
-    const relay = await relayReplyIfConfigured({ reply, notification })
-    if (relay.status === 'forwarded') reply.status = 'forwarded'
-    else if (relay.status === 'failed') reply.status = 'failed'
-    else reply.status = 'stubbed'
-    if (relay.error) reply.error = relay.error
-    replies.push(reply)
-    await appendJsonl(repliesFile, reply)
+    let relay
+    try {
+      relay = await relayReplyIfConfigured({ reply, notification })
+      if (relay.status === 'forwarded') reply.status = 'forwarded'
+      else if (relay.status === 'failed') reply.status = 'failed'
+      else reply.status = 'stubbed'
+      if (relay.error) reply.error = relay.error
+      replies.push(reply)
+      await appendJsonl(repliesFile, reply)
+    } catch (err) {
+      const errMessage = err instanceof Error ? err.message : String(err)
+      reply.status = 'failed'
+      reply.error = errMessage
+      log(
+        `command relay threw id=${commandId} source=${source} error=${errMessage}`,
+      )
+      // Best-effort audit append; do not double-throw.
+      try {
+        replies.push(reply)
+        await appendJsonl(repliesFile, reply)
+      } catch (appendErr) {
+        log(
+          `command reply append failed id=${commandId} error=${appendErr instanceof Error ? appendErr.message : String(appendErr)}`,
+        )
+      }
+      return sendJson(res, 502, { ok: false, error: 'relay failed', details: errMessage })
+    }
 
     log(
       `command accepted id=${commandId} source=${source} length=${sanitizedText.length} status=${relay.status}`,
