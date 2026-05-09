@@ -14,6 +14,22 @@ import {
   safeJsonParse,
 } from './notification-utils.mjs'
 import { transcribeAudioWithGroq } from './stt.mjs'
+import { log } from './core/log.mjs'
+import {
+  applyCors,
+  isBodyTooLargeError,
+  parseUrl,
+  sendJson,
+  sendRequestBodyTooLarge,
+  sendText,
+} from './core/http.mjs'
+import {
+  UI_SESSION,
+  createUiSession,
+  hasValidUiSession,
+  isPublicApiRequest,
+  requireApiAuth as coreRequireApiAuth,
+} from './core/auth.mjs'
 
 const legacyHubBind = process.env.HUB_BIND
 const bindModeRaw = process.env.HUB_BIND_MODE
@@ -102,13 +118,9 @@ const approvals = []
 const approvalsById = new Map()
 /** @type {Map<string, ApprovalRecord>} */
 const approvalsByNotificationId = new Map()
-/** @type {Map<string, number>} */
-const uiSessions = new Map()
 /** @type {{lat:number,lng:number,altitude:number|null,timestamp:string,speed:number|null,battery:number|null,receivedAt:string}|null} */
 let lastLocation = null
 const approvalsFile = path.join(dataDir, 'approvals.jsonl')
-const UI_SESSION_COOKIE = 'cc_g2_ui_session'
-const UI_SESSION_MAX_AGE_SEC = 60 * 60 * 12
 
 async function ensureDataDir() {
   await mkdir(dataDir, { recursive: true })
@@ -132,130 +144,8 @@ async function appendJsonl(filePath, obj) {
   await appendFile(filePath, `${JSON.stringify(obj)}\n`, 'utf8')
 }
 
-function log(...args) {
-  console.log(new Date().toISOString(), ...args)
-}
-
-function withCorsHeaders(res) {
-  res.setHeader('Vary', 'Origin')
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-CC-G2-Token')
-}
-
-function getHostname(value, assumeHttp = false) {
-  try {
-    if (assumeHttp) return new URL(`http://${value}`).hostname
-    return new URL(value).hostname
-  } catch {
-    return ''
-  }
-}
-
-function isAllowedOrigin(req) {
-  const origin = req.headers.origin
-  if (!origin) return true
-  const originHostname = getHostname(origin)
-  const requestHostname = getHostname(String(req.headers.host || ''), true)
-  if (!originHostname) return false
-  if (originHostname === requestHostname) return true
-  if (hubAllowedOrigins.has(origin)) return true
-  return false
-}
-
-function applyCors(req, res) {
-  withCorsHeaders(res)
-  const origin = req.headers.origin
-  if (!origin) return true
-  if (!isAllowedOrigin(req)) return false
-  res.setHeader('Access-Control-Allow-Origin', origin)
-  return true
-}
-
-function sendJson(res, statusCode, body) {
-  res.statusCode = statusCode
-  res.setHeader('Content-Type', 'application/json; charset=utf-8')
-  res.end(JSON.stringify(body, null, 2))
-}
-
-function sendText(res, statusCode, body) {
-  res.statusCode = statusCode
-  res.setHeader('Content-Type', 'text/plain; charset=utf-8')
-  res.end(body)
-}
-
-function sendRequestBodyTooLarge(res, err) {
-  const maxBytes =
-    err && typeof err === 'object' && 'maxBytes' in err && Number.isFinite(err.maxBytes)
-      ? err.maxBytes
-      : undefined
-  return sendJson(res, 413, {
-    ok: false,
-    error: maxBytes ? `Request body too large (max ${maxBytes} bytes)` : 'Request body too large',
-  })
-}
-
-function isBodyTooLargeError(err) {
-  return !!err && typeof err === 'object' && 'code' in err && err.code === 'BODY_TOO_LARGE'
-}
-
-function parseCookies(req) {
-  const raw = String(req.headers.cookie || '')
-  if (!raw) return new Map()
-  return new Map(
-    raw
-      .split(';')
-      .map((part) => part.trim())
-      .filter(Boolean)
-      .map((part) => {
-        const idx = part.indexOf('=')
-        if (idx < 0) return [part, '']
-        return [part.slice(0, idx), decodeURIComponent(part.slice(idx + 1))]
-      }),
-  )
-}
-
-function createUiSession() {
-  const token = randomUUID()
-  uiSessions.set(token, Date.now() + UI_SESSION_MAX_AGE_SEC * 1000)
-  return token
-}
-
-function cleanupExpiredUiSessions() {
-  const now = Date.now()
-  for (const [token, expiresAt] of uiSessions.entries()) {
-    if (expiresAt <= now) uiSessions.delete(token)
-  }
-}
-
-function hasValidUiSession(req) {
-  cleanupExpiredUiSessions()
-  const token = parseCookies(req).get(UI_SESSION_COOKIE)
-  if (!token) return false
-  const expiresAt = uiSessions.get(token)
-  if (!expiresAt || expiresAt <= Date.now()) {
-    uiSessions.delete(token)
-    return false
-  }
-  return true
-}
-
 function requireApiAuth(req, res) {
-  if (!hubAuthToken) return true
-  const provided = String(req.headers['x-cc-g2-token'] || '').trim()
-  if (provided === hubAuthToken) return true
-  if (hasValidUiSession(req)) return true
-  sendJson(res, 401, { ok: false, error: 'Unauthorized' })
-  return false
-}
-
-function isPublicApiRequest(method, pathname) {
-  if (method === 'GET' && pathname === '/api/health') return true
-  if (method === 'GET' && pathname === '/api/context-status') return true
-  if (method === 'GET' && pathname === '/api/notifications') return true
-  if (method === 'POST' && pathname === '/api/client-events') return true
-  if (method === 'POST' && pathname === '/api/location') return true
-  if (method === 'GET' && matchNotificationDetail(pathname)) return true
-  return false
+  return coreRequireApiAuth(req, res, hubAuthToken)
 }
 
 async function addNotification(payload, logPrefix = 'notification') {
@@ -837,10 +727,10 @@ async function handlePermissionRequestHook(req, res) {
 
 const handler = async (req, res) => {
   const method = req.method || 'GET'
-  const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`)
+  const url = parseUrl(req)
   const pathname = url.pathname
 
-  if (!applyCors(req, res)) {
+  if (!applyCors(req, res, hubAllowedOrigins)) {
     return sendJson(res, 403, { ok: false, error: 'Origin not allowed' })
   }
 
@@ -1368,7 +1258,7 @@ const handler = async (req, res) => {
         res.statusCode = 302
         res.setHeader(
           'Set-Cookie',
-          `${UI_SESSION_COOKIE}=${session}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${UI_SESSION_MAX_AGE_SEC}`,
+          `${UI_SESSION.cookie}=${session}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${UI_SESSION.maxAgeSec}`,
         )
         res.setHeader('Location', '/ui')
         return res.end()
