@@ -35,7 +35,7 @@ function resolveBindHosts() {
   if (bindMode === 'any') return ['0.0.0.0']
   const hosts = ['127.0.0.1']
   if (tailscaleIp) hosts.push(tailscaleIp)
-  else console.warn('[hub] Tailscale未稼働のため localhost only でlisten')
+  else console.warn('[hub] HUB_TAILSCALE_IP not set — listening on loopback only')
   return hosts
 }
 
@@ -1414,6 +1414,11 @@ await bootstrap()
 const bindHosts = resolveBindHosts()
 const servers = bindHosts.map((bindHost) => {
   const s = createServer(handler)
+  s.on('error', (err) => {
+    log(`[hub] listen failed on ${bindHost}: ${err.code} ${err.message}`)
+    process.exitCode = 1
+    shutdown('listen-error')
+  })
   s.listen(port, bindHost, () => {
     log(`notification-hub listening on http://${bindHost}:${port}`)
   })
@@ -1427,6 +1432,7 @@ function shutdown(signal) {
   log(`notification-hub shutting down (${signal})`)
   for (const s of servers) {
     try { s.close() } catch {}
+    try { s.closeAllConnections() } catch {}
   }
 }
 process.on('SIGINT', () => shutdown('SIGINT'))
