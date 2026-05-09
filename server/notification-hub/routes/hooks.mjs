@@ -11,73 +11,7 @@ import {
 } from '../notification-utils.mjs'
 import { isBodyTooLargeError, sendJson, sendRequestBodyTooLarge } from '../core/http.mjs'
 import { log } from '../core/log.mjs'
-import * as store from '../state/store.mjs'
-
-const HOOK_POLL_TIMEOUT_MS = 600_000
-const HOOK_POLL_INTERVAL_MS = 2_000
-
-function buildToolPreview(toolName, toolInput) {
-  if (toolName === 'Bash') {
-    return toolInput?.command || ''
-  } else if (toolName === 'apply_patch') {
-    return buildApplyPatchPreview(toolInput)
-  } else if (toolName === 'Edit') {
-    const file = toolInput?.file_path || ''
-    const old = (toolInput?.old_string || '').slice(0, 2000)
-    const new_ = (toolInput?.new_string || '').slice(0, 2000)
-    return `${file}\n--- old ---\n${old}\n+++ new +++\n${new_}`
-  } else if (toolName === 'Write') {
-    const file = toolInput?.file_path || ''
-    const content = (toolInput?.content || '').slice(0, 2000)
-    return `${file}\n${content}`
-  } else {
-    return JSON.stringify(toolInput || {}).slice(0, 2000)
-  }
-}
-
-function buildApplyPatchPreview(toolInput) {
-  const patch = getApplyPatchRawString(toolInput)
-  if (patch === null) return JSON.stringify(toolInput || {}).slice(0, 2000)
-
-  const fileLines = []
-  const seen = new Set()
-  for (const line of patch.split(/\r?\n/)) {
-    const match = line.match(/^\*\*\* (Add|Update|Delete) File: (.+)$/)
-    if (match) {
-      const label = match[1] === 'Add' ? 'add' : match[1] === 'Update' ? 'edit' : 'delete'
-      const key = `${label}:${match[2]}`
-      if (!seen.has(key)) {
-        seen.add(key)
-        fileLines.push(`- ${label} ${match[2]}`)
-      }
-    }
-  }
-
-  const patchLines = patch
-    .replace(/\r\n/g, '\n')
-    .split('\n')
-    .slice(0, 80)
-    .map((line) => (line.length > 160 ? `${line.slice(0, 159)}…` : line))
-    .join('\n')
-
-  const summary = fileLines.length > 0
-    ? ['Files:', ...fileLines.slice(0, 12), ''].join('\n')
-    : ''
-  const truncated = patch.split(/\r?\n/).length > 80 ? '\n…' : ''
-  return `${summary}${patchLines}${truncated}`.slice(0, 4000)
-}
-
-function getApplyPatchRawString(toolInput) {
-  for (const key of ['command', 'input', 'patch']) {
-    const value = toolInput?.[key]
-    if (typeof value === 'string' && value.length > 0) return value
-  }
-  return null
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
+import { buildToolPreview } from '../services/approval-service.mjs'
 
 async function handlePermissionRequestHook(req, res, deps) {
   let body
@@ -156,56 +90,31 @@ async function handlePermissionRequestHook(req, res, deps) {
   req.on('close', onClose)
   res.on('close', onClose)
 
-  const deadline = Date.now() + HOOK_POLL_TIMEOUT_MS
-  while (Date.now() < deadline) {
-    await sleep(HOOK_POLL_INTERVAL_MS)
-    if (clientDisconnected) {
-      const record = store.approvalsById.get(approval.id)
-      if (record && record.status === 'pending') {
-        deps.markApprovalCleanup(record, 'terminal-disconnect', 'terminal')
-        log(`approval cleaned up by terminal disconnect id=${record.id}`)
-      }
-      req.off('close', onClose)
-      res.off('close', onClose)
-      return
-    }
-    const record = store.approvalsById.get(approval.id)
-    if (record && record.status === 'decided') {
-      record.deliveredAt = new Date().toISOString()
-      req.off('close', onClose)
-      res.off('close', onClose)
-      if (record.decision === 'approve') {
-        sendJson(res, 200, {
-          hookSpecificOutput: {
-            hookEventName: 'PermissionRequest',
-            decision: { behavior: 'allow' },
-          },
-        })
-        return
-      }
-      if (record.decision === 'deny') {
-        const message = record.comment
-          ? `G2: ${record.comment}`
-          : 'G2から拒否されました'
-        sendJson(res, 200, {
-          hookSpecificOutput: {
-            hookEventName: 'PermissionRequest',
-            decision: { behavior: 'deny', message },
-          },
-        })
-        return
-      }
-      log(
-        `approval cleanup observed while waiting id=${record.id} resolution=${record.resolution || 'unknown'}`,
-      )
-      sendJson(res, 200, {})
-      return
-    }
-  }
-
-  // Timeout: return empty response → Claude Code shows normal dialog
+  const result = await deps.waitForApprovalDecision({
+    approvalId: approval.id,
+    isDisconnected: () => clientDisconnected,
+  })
   req.off('close', onClose)
   res.off('close', onClose)
+
+  if (result.outcome === 'disconnected') {
+    const cleaned = deps.cleanupApprovalOnDisconnect(approval.id)
+    if (cleaned) {
+      log(`approval cleaned up by terminal disconnect id=${cleaned.id}`)
+    }
+    return
+  }
+  if (result.outcome === 'decided') {
+    if (result.record.status === 'decided' && !result.record.decision) {
+      log(
+        `approval cleanup observed while waiting id=${result.record.id} resolution=${result.record.resolution || 'unknown'}`,
+      )
+    }
+    const response = deps.buildHookResponseFromApproval(result.record)
+    sendJson(res, response.status, response.body)
+    return
+  }
+  // Timeout: return empty response → Claude Code shows normal dialog
   sendJson(res, 200, {})
 }
 

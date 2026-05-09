@@ -13,6 +13,69 @@ import * as store from '../state/store.mjs'
 import { appendJsonl } from '../state/persistence.mjs'
 
 /**
+ * Build a human-readable preview string for a hook tool_input. Used by the
+ * permission-request long-poll route as the notification body.
+ */
+export function buildToolPreview(toolName, toolInput) {
+  if (toolName === 'Bash') {
+    return toolInput?.command || ''
+  } else if (toolName === 'apply_patch') {
+    return buildApplyPatchPreview(toolInput)
+  } else if (toolName === 'Edit') {
+    const file = toolInput?.file_path || ''
+    const old = (toolInput?.old_string || '').slice(0, 2000)
+    const new_ = (toolInput?.new_string || '').slice(0, 2000)
+    return `${file}\n--- old ---\n${old}\n+++ new +++\n${new_}`
+  } else if (toolName === 'Write') {
+    const file = toolInput?.file_path || ''
+    const content = (toolInput?.content || '').slice(0, 2000)
+    return `${file}\n${content}`
+  } else {
+    return JSON.stringify(toolInput || {}).slice(0, 2000)
+  }
+}
+
+function buildApplyPatchPreview(toolInput) {
+  const patch = getApplyPatchRawString(toolInput)
+  if (patch === null) return JSON.stringify(toolInput || {}).slice(0, 2000)
+
+  const fileLines = []
+  const seen = new Set()
+  for (const line of patch.split(/\r?\n/)) {
+    const match = line.match(/^\*\*\* (Add|Update|Delete) File: (.+)$/)
+    if (match) {
+      const label = match[1] === 'Add' ? 'add' : match[1] === 'Update' ? 'edit' : 'delete'
+      const key = `${label}:${match[2]}`
+      if (!seen.has(key)) {
+        seen.add(key)
+        fileLines.push(`- ${label} ${match[2]}`)
+      }
+    }
+  }
+
+  const patchLines = patch
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .slice(0, 80)
+    .map((line) => (line.length > 160 ? `${line.slice(0, 159)}…` : line))
+    .join('\n')
+
+  const summary = fileLines.length > 0
+    ? ['Files:', ...fileLines.slice(0, 12), ''].join('\n')
+    : ''
+  const truncated = patch.split(/\r?\n/).length > 80 ? '\n…' : ''
+  return `${summary}${patchLines}${truncated}`.slice(0, 4000)
+}
+
+function getApplyPatchRawString(toolInput) {
+  for (const key of ['command', 'input', 'patch']) {
+    const value = toolInput?.[key]
+    if (typeof value === 'string' && value.length > 0) return value
+  }
+  return null
+}
+
+/**
  * Create a new approval record. Side-effect: also creates a linked
  * notification via the supplied addNotification function (injected by
  * the caller to keep the service free of hub-config knowledge).
@@ -252,4 +315,94 @@ export function cleanupOnRequesterDisconnect(approvalId, cfg) {
   const record = store.approvalsById.get(approvalId)
   if (!record || record.status !== 'pending') return null
   return markApprovalCleanup(record, 'terminal-disconnect', 'terminal', new Date().toISOString(), cfg)
+}
+
+const HOOK_POLL_TIMEOUT_MS = 600_000
+const HOOK_POLL_INTERVAL_MS = 2_000
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * Wait for a pending approval to be decided (or for the requester to
+ * disconnect). Polls the in-memory store at a fixed interval.
+ *
+ * Outcomes:
+ *   - 'decided'        — approval reached `decided` status. record is the
+ *                        latest snapshot. Caller should send the response
+ *                        via buildHookResponseFromApproval(record).
+ *   - 'disconnected'   — isDisconnected() returned true before a decision.
+ *                        Caller is responsible for cleanup via
+ *                        cleanupOnRequesterDisconnect.
+ *   - 'timeout'        — poll deadline reached. Caller returns 200 {} so
+ *                        Claude Code falls back to its native dialog.
+ *
+ * @param {{
+ *   approvalId: string,
+ *   isDisconnected: () => boolean,
+ *   timeoutMs?: number,
+ *   pollIntervalMs?: number,
+ * }} params
+ * @returns {Promise<{ outcome: 'decided'|'disconnected'|'timeout', record: import('../state/store.mjs').ApprovalRecord | null }>}
+ */
+export async function waitForDecision(params) {
+  const {
+    approvalId,
+    isDisconnected,
+    timeoutMs = HOOK_POLL_TIMEOUT_MS,
+    pollIntervalMs = HOOK_POLL_INTERVAL_MS,
+  } = params
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    await sleep(pollIntervalMs)
+    if (isDisconnected()) {
+      return { outcome: 'disconnected', record: store.approvalsById.get(approvalId) || null }
+    }
+    const record = store.approvalsById.get(approvalId)
+    if (record && record.status === 'decided') {
+      record.deliveredAt = new Date().toISOString()
+      return { outcome: 'decided', record }
+    }
+  }
+  return { outcome: 'timeout', record: store.approvalsById.get(approvalId) || null }
+}
+
+/**
+ * Build the HTTP hook response from a decided approval. Returns a payload
+ * suitable for sendJson(res, 200, body).
+ *
+ * - approve → allow
+ * - deny → deny with `G2: <comment>` or default message
+ * - other (e.g. cleanup observed mid-wait) → empty body so Claude Code
+ *   shows its native dialog.
+ *
+ * @param {import('../state/store.mjs').ApprovalRecord} record
+ */
+export function buildHookResponseFromApproval(record) {
+  if (!record) return { status: 200, body: {} }
+  if (record.decision === 'approve') {
+    return {
+      status: 200,
+      body: {
+        hookSpecificOutput: {
+          hookEventName: 'PermissionRequest',
+          decision: { behavior: 'allow' },
+        },
+      },
+    }
+  }
+  if (record.decision === 'deny') {
+    const message = record.comment ? `G2: ${record.comment}` : 'G2から拒否されました'
+    return {
+      status: 200,
+      body: {
+        hookSpecificOutput: {
+          hookEventName: 'PermissionRequest',
+          decision: { behavior: 'deny', message },
+        },
+      },
+    }
+  }
+  return { status: 200, body: {} }
 }

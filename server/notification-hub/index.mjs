@@ -22,11 +22,14 @@ import {
   processReply as notificationServiceProcessReply,
 } from './services/notification-service.mjs'
 import {
+  buildHookResponseFromApproval,
   cleanupApprovalsOnStop as approvalServiceCleanupOnStop,
+  cleanupOnRequesterDisconnect as approvalServiceCleanupOnDisconnect,
   createApproval as approvalServiceCreate,
   markApprovalCleanup as approvalServiceMarkCleanup,
   matchPendingApprovalForReply as approvalServiceMatchForReply,
   resolveApproval as approvalServiceResolve,
+  waitForDecision as approvalServiceWaitForDecision,
 } from './services/approval-service.mjs'
 import { createTmuxRelay } from './transport/tmux-relay.mjs'
 import * as healthRoute from './routes/health.mjs'
@@ -86,6 +89,11 @@ const resolveApproval = (id, decision, comment, by) =>
 const markApprovalCleanup = (record, resolution, by, at) =>
   approvalServiceMarkCleanup(record, resolution, by, at, approvalCfg())
 
+const cleanupApprovalOnDisconnect = (approvalId) =>
+  approvalServiceCleanupOnDisconnect(approvalId, approvalCfg())
+
+const waitForApprovalDecision = (params) => approvalServiceWaitForDecision(params)
+
 const relayReplyIfConfigured = createTmuxRelay({
   cmd: config.hubReplyRelayCmd,
   timeoutMs: config.hubReplyRelayTimeoutMs,
@@ -143,6 +151,9 @@ const deps = {
   createApproval,
   resolveApproval,
   markApprovalCleanup,
+  cleanupApprovalOnDisconnect,
+  waitForApprovalDecision,
+  buildHookResponseFromApproval,
   forwardReplyIfConfigured,
   relayReplyIfConfigured,
   processReply,
