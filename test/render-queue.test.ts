@@ -59,6 +59,34 @@ describe('render-queue', () => {
     expect(order).toEqual(['first-start', 'first-end', 'third-start'])
   })
 
+  it('replace does not interrupt the currently running fn', async () => {
+    const queue = createRenderQueue({ log: () => {} })
+    const order: string[] = []
+    const first = deferred()
+
+    const p1 = queue.enqueue(async () => {
+      order.push('first-start')
+      await first.promise
+      order.push('first-end')
+    })
+
+    // While p1 is still awaiting, replace queues p2. p3 should be queued
+    // BEHIND p1 (not run concurrently or before it).
+    const p2 = queue.replace(async () => {
+      order.push('second-start')
+    })
+
+    // Give microtasks a chance — p2 must NOT have started yet.
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(order).toEqual(['first-start'])
+    expect(queue.isRendering()).toBe(true)
+
+    first.resolve()
+    await Promise.all([p1, p2])
+    expect(order).toEqual(['first-start', 'first-end', 'second-start'])
+  })
+
   it('throw in fn does not stop queue', async () => {
     const queue = createRenderQueue({ log: () => {} })
     const order: string[] = []

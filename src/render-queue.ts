@@ -101,8 +101,16 @@ export function createRenderQueue(options: RenderQueueOptions = {}): RenderQueue
     })
   }
 
+  /**
+   * Queue `fn` and cancel any **not-yet-started** jobs ahead of it. The
+   * currently-running job (if any) is NOT interrupted — `replace()` waits
+   * behind it. This matters when callers think of replace() as "skip
+   * queue, run now": the in-flight render still completes first.
+   *
+   * Use `enqueue()` for normal serialization; use `replace()` to coalesce
+   * a burst of redraw requests so only the latest one paints.
+   */
   function replace(fn: RenderFn): Promise<void> {
-    // 待機中の未開始ジョブをすべて cancel する (実行中はそのまま走らせる)。
     for (const pending of queue) {
       pending.cancelled = true
     }

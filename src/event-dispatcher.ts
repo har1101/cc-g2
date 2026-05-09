@@ -54,11 +54,16 @@ export function createEventDispatcher(deps: EventDispatcherDeps): EventDispatche
         if (result && typeof (result as Promise<void>).then === 'function') {
           ;(result as Promise<void>).catch((err) => {
             const msg = err instanceof Error ? err.message : String(err)
+            // log() is best-effort UI mirroring; also write to console.error so
+            // headless / hardware-only sessions surface the failure even when
+            // the in-page #event-log element is absent.
+            console.error('[event-dispatcher] handler rejected', err)
             deps.log(`[event-dispatcher] handler threw: ${msg}`)
           })
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
+        console.error('[event-dispatcher] handler threw (sync)', err)
         deps.log(`[event-dispatcher] handler threw (sync): ${msg}`)
       }
     })

@@ -873,7 +873,7 @@ async function startVoiceCommandRecording() {
   store.voice.startInFlight = true
   // start のたびに世代を 1 つ進める。stop/send 側はこの値をキャプチャしておき、
   // await 後にグローバルが進んでいたら（=cancel または再 start 済み）状態を上書きしない。
-  const gen = ++store.voice.generation
+  const gen = bumpVoiceGeneration()
   try {
     store.voice.audioChunks = []
     store.voice.audioTotalBytes = 0
@@ -909,7 +909,7 @@ async function startVoiceCommandRecording() {
     // 録音開始の途中失敗は state を必ず idle に戻す。世代も進めて、もし stopAudio など
     // 既にスケジュール済みのコールバックが返ってきても無視されるようにする。
     resetVoiceCommandStateToIdle()
-    store.voice.generation++
+    bumpVoiceGeneration()
     if (currentVoiceAudioHandle) {
       try { await currentVoiceAudioHandle.release() } catch { /* ignore */ }
       currentVoiceAudioHandle = null
@@ -1019,7 +1019,7 @@ async function stopVoiceCommandRecording(reason: string) {
 async function cancelVoiceCommandRecording(reason: string) {
   if (!connection) return
   // 進行中の stop / send が await 後に状態を上書きできないよう世代を進める。
-  store.voice.generation++
+  bumpVoiceGeneration()
   clearVoiceCommandRecordingMaxTimer()
   if (store.voice.isRecording) {
     store.voice.isRecording = false
@@ -1717,7 +1717,7 @@ async function handleNotifEvent(conn: BridgeConnection, event: EvenHubEvent) {
       } else if (notifState.screen === 'voice-command-confirm') {
         if (isDoubleTapEventType(eventType)) {
           log('voice-command: 確認画面 → キャンセル')
-          store.voice.generation++
+          bumpVoiceGeneration()
           store.voice.finalText = ''
           await returnToIdleFromVoiceCommand('user-cancel-confirm')
           return
@@ -1733,7 +1733,7 @@ async function handleNotifEvent(conn: BridgeConnection, event: EvenHubEvent) {
           log('voice-command: 送信中に double tap → 強制 idle 復帰')
           cancelPendingIdleSingleTap()
           store.voice.sendCancelled = true
-          store.voice.generation++
+          bumpVoiceGeneration()
           await returnToIdleFromVoiceCommand('user-cancel-during-send')
           return
         }
