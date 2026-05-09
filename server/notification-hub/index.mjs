@@ -15,7 +15,30 @@ import {
 } from './notification-utils.mjs'
 import { transcribeAudioWithGroq } from './stt.mjs'
 
-const host = process.env.HUB_BIND || '0.0.0.0'
+const legacyHubBind = process.env.HUB_BIND
+const bindModeRaw = process.env.HUB_BIND_MODE
+let bindMode = bindModeRaw || 'tailnet'
+if (!['tailnet', 'localhost', 'any'].includes(bindMode)) {
+  console.warn(`[hub] unknown HUB_BIND_MODE="${bindMode}" — falling back to "tailnet"`)
+  bindMode = 'tailnet'
+}
+const tailscaleIp = String(process.env.HUB_TAILSCALE_IP || '').trim()
+
+// Internal hook scripts hard-code http://127.0.0.1:8787, so 'tailnet' must keep
+// loopback reachable while phones reach us via the Tailscale IP. See design §7.1.
+function resolveBindHosts() {
+  if (!bindModeRaw && legacyHubBind) {
+    console.warn('[hub] HUB_BIND is deprecated — set HUB_BIND_MODE (tailnet|localhost|any) instead')
+    return [legacyHubBind]
+  }
+  if (bindMode === 'localhost') return ['127.0.0.1']
+  if (bindMode === 'any') return ['0.0.0.0']
+  const hosts = ['127.0.0.1']
+  if (tailscaleIp) hosts.push(tailscaleIp)
+  else console.warn('[hub] Tailscale未稼働のため localhost only でlisten')
+  return hosts
+}
+
 const port = Number(process.env.HUB_PORT || '8787')
 const dataDir = path.resolve(process.env.HUB_DATA_DIR || 'tmp/notification-hub')
 const hubAuthToken = String(process.env.HUB_AUTH_TOKEN || '').trim()
@@ -803,7 +826,7 @@ async function handlePermissionRequestHook(req, res) {
   sendJson(res, 200, {})
 }
 
-const server = createServer(async (req, res) => {
+const handler = async (req, res) => {
   const method = req.method || 'GET'
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`)
   const pathname = url.pathname
@@ -1384,9 +1407,27 @@ const server = createServer(async (req, res) => {
     }
     throw err
   }
-})
+}
 
 await bootstrap()
-server.listen(port, host, () => {
-  log(`notification-hub listening on http://${host}:${port}`)
+
+const bindHosts = resolveBindHosts()
+const servers = bindHosts.map((bindHost) => {
+  const s = createServer(handler)
+  s.listen(port, bindHost, () => {
+    log(`notification-hub listening on http://${bindHost}:${port}`)
+  })
+  return s
 })
+
+let shuttingDown = false
+function shutdown(signal) {
+  if (shuttingDown) return
+  shuttingDown = true
+  log(`notification-hub shutting down (${signal})`)
+  for (const s of servers) {
+    try { s.close() } catch {}
+  }
+}
+process.on('SIGINT', () => shutdown('SIGINT'))
+process.on('SIGTERM', () => shutdown('SIGTERM'))
