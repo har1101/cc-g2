@@ -463,7 +463,12 @@ async function startVoiceCommandRecordingStreaming(): Promise<void> {
     }
     if (typeof session.onError === 'function') {
       session.onError((err) => {
-        d.log(`voice-command-streaming: engine error code=${err.code} msg=${err.message}`)
+        // Codex 2 #6: previously this was log-only, leaving the audio handle
+        // and recording state stuck if the upstream WS dropped. Now we tear
+        // down the streaming session: cancel engine, release mic, return idle.
+        d.log(`voice-command-streaming: engine error code=${err.code} msg=${err.message} → cancel`)
+        if (store.voice.generation !== gen) return // stale callback after cancel
+        void cancelVoiceCommandStreaming(`engine-error:${err.code}`).catch(() => { /* swallow */ })
       })
     }
     // Phase 2 Pass 5: late-final handling.

@@ -29,7 +29,13 @@ export const appConfig = {
   // Phase 2: voice-command engine selection. Permission コメント (短文) は
   // 常に groq-batch を使うため、 ここは voice-command 用のみ。
   // - groq-batch (default, Phase 1 互換)
-  // - deepgram-stream (Phase 2 新規パス)
+  // - deepgram-stream (Phase 2 新規パス、 DEEPGRAM_API_KEY 必要)
+  //
+  // 設計書 §Phase 2.4 では deepgram-stream を default に挙げているが、
+  // fork 運用で API key 未設定の環境がいきなり 502 を吐くのを避けるため、
+  // 実装 default は groq-batch のまま。 deepgram-stream を有効にしたい場合は
+  // .env.local に `VITE_STT_ENGINE_VOICE_COMMAND=deepgram-stream` + Hub 側で
+  // `DEEPGRAM_API_KEY` を設定する。
   sttEngineVoiceCommand: readSttEngineKind(import.meta.env.VITE_STT_ENGINE_VOICE_COMMAND as string | undefined),
 }
 

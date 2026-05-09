@@ -165,6 +165,14 @@ export function createDeepgramEngine(config = {}) {
             // Concatenate; Deepgram already includes spaces/punctuation
             // when smart_format is enabled, but we still join with space
             // to be safe across utterance boundaries.
+            //
+            // Codex 2 #3: Deepgram normally emits each `is_final=true` for a
+            // distinct speech segment, so plain concatenation is correct in
+            // the common case. However, overlapping is_final deltas (rare,
+            // mostly during refinements at word boundaries) could duplicate
+            // text. If field-tested traces show this, swap to a suffix-overlap
+            // de-dup pass here. For now we keep the simpler, predictable
+            // append + observability via lastFinalText so we can detect it.
             stableText = stableText ? `${stableText}${transcript}` : transcript
             lastFinalText = transcript
             stableSeq += 1

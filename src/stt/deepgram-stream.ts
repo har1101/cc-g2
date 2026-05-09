@@ -58,18 +58,20 @@ function buildStreamUrl(): string {
 /**
  * Open a WebSocket. Browsers do not allow custom headers on `new WebSocket()`,
  * so we encode the auth token as the `Sec-WebSocket-Protocol` subprotocol.
- * The Hub also accepts `?token=` query param when the protocol path is not
- * available — but the design requires X-CC-G2-Token as the canonical channel.
+ * The Hub upgrade handler accepts the token via header / subprotocol /
+ * `?token=` query (in that priority order).
  *
- * Workaround: attach a `?token=` query string. The Hub upgrade handler must
- * also accept the token via query when present (left for backend follow-up).
- *
- * For now, we still try the header path via Sec-WebSocket-Protocol and let
- * the Hub fall back to query if it cannot read protocols.
+ * Codex 2 #8: `?token=` query is a LAST-RESORT fallback. Tokens in URLs leak
+ * into HTTP access logs, browser history, error reports, etc. We rely on the
+ * subprotocol path for current-generation browsers; the query string is kept
+ * only for older browsers / proxies that strip subprotocol negotiation. Do
+ * NOT propagate this URL anywhere it would be persisted.
  */
 function openWs(url: string, token: string, deps?: { wsFactory?: WebSocketFactory }): WebSocket {
   const u = new URL(url)
   if (token) {
+    // Subprotocol is the preferred path. Query string is a defensive fallback
+    // because some legacy proxies/firewalls strip subprotocol negotiation.
     u.searchParams.set('token', token)
   }
   const factory = deps?.wsFactory ?? ((u: string, _protocols?: string | string[]) => new WebSocket(u))

@@ -90,19 +90,32 @@ async function runStreamSession(ctx) {
   // has been pushed.
   let queue = Promise.resolve()
 
-  ws.on('error', (err) => {
-    log('[stt-stream] ws error:', err && err.message ? err.message : err)
-  })
-
-  ws.on('close', () => {
+  // One-shot cleanup: decrement the active counter exactly once and cancel
+  // the upstream Deepgram session if the client vanished without finalize.
+  // Codex 2 #2: previously only `close` decremented; if `error` fired without
+  // a subsequent `close`, activeConnections leaked. ws normally fires close
+  // after error, but be defensive — a torn TLS frame can leave the socket
+  // half-open.
+  let cleanedUp = false
+  function cleanupOnExit() {
+    if (cleanedUp) return
+    cleanedUp = true
     closed = true
     activeConnections = Math.max(0, activeConnections - 1)
-    // If the client disappeared without finalize/cancel, drop the upstream.
     queue = queue.then(() => {
       if (session && !finalized && !cancelled) {
         return Promise.resolve(session.cancel()).catch(() => {})
       }
     }).catch(() => {})
+  }
+
+  ws.on('error', (err) => {
+    log('[stt-stream] ws error:', err && err.message ? err.message : err)
+    cleanupOnExit()
+  })
+
+  ws.on('close', () => {
+    cleanupOnExit()
   })
 
   async function handleStart(payload) {
@@ -275,14 +288,24 @@ export function attachSttStreamWss(httpServer, deps) {
     throw new Error('attachSttStreamWss: createSttEngine is required')
   }
 
-  // handleProtocols: when the browser advertises `cc-g2-token.<token>` we echo
-  // it back so the connection completes. ws default would otherwise reject the
-  // subprotocol and break the auth path used by browsers.
+  // handleProtocols: when the browser advertises `cc-g2-token.<expectedToken>`
+  // we echo it back so the connection completes. ws default would otherwise
+  // reject the subprotocol and break the auth path used by browsers.
+  // Codex 2 #1: only echo the exact matching token to avoid leaking arbitrary
+  // client-supplied subprotocol values back to authenticated header clients.
+  const expectedSubproto = hubAuthToken ? `cc-g2-token.${hubAuthToken}` : null
   const wss = new WebSocketServer({
     noServer: true,
     handleProtocols: (offered) => {
+      if (!expectedSubproto) {
+        // No auth configured — accept any cc-g2-token.* as a courtesy.
+        for (const p of offered) {
+          if (typeof p === 'string' && p.startsWith('cc-g2-token.')) return p
+        }
+        return false
+      }
       for (const p of offered) {
-        if (typeof p === 'string' && p.startsWith('cc-g2-token.')) return p
+        if (p === expectedSubproto) return p
       }
       return false
     },
