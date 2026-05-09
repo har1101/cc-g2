@@ -1,9 +1,7 @@
 // /api/hooks/permission-request (long-poll HTTP hook for Claude Code / Codex)
 // /api/notify/moshi (MOSHI inbound notifications)
 import { randomUUID } from 'node:crypto'
-import path from 'node:path'
 import {
-  deriveSessionLabel,
   getString,
   normalizeMoshiPayload,
   readRequestBody,
@@ -11,7 +9,7 @@ import {
 } from '../notification-utils.mjs'
 import { isBodyTooLargeError, sendJson, sendRequestBodyTooLarge } from '../core/http.mjs'
 import { log } from '../core/log.mjs'
-import { buildToolPreview } from '../services/approval-service.mjs'
+import { normalizePermissionRequestPayload } from '../services/approval-service.mjs'
 
 async function handlePermissionRequestHook(req, res, deps) {
   let body
@@ -29,60 +27,15 @@ async function handlePermissionRequestHook(req, res, deps) {
     sendJson(res, 400, { error: 'Invalid JSON body' })
     return
   }
-  const p = parsed.value
-  const tmuxTarget = req.headers['x-tmux-target'] || ''
-  const toolName = getString(p.tool_name)
-  const toolInput = p.tool_input || {}
-  const cwd = getString(p.cwd)
-  const sessionId = getString(p.session_id)
-  const agentSource = getString(req.headers['x-agent-source']) === 'codex' ? 'codex' : 'claude-code'
-  const approvalSource = agentSource === 'codex' ? 'codex-hook' : 'claude-code-hook'
 
-  const title = toolName
-  let preview = buildToolPreview(toolName, toolInput)
-
-  // AskUserQuestion: questions metadata を追加し、プレビューを整形
-  const isAskQ = toolName === 'AskUserQuestion' && Array.isArray(toolInput.questions)
-  const extraMeta = {}
-  if (isAskQ) {
-    const previewLines = []
-    for (const q of toolInput.questions) {
-      previewLines.push(q.question || '')
-      if (Array.isArray(q.options)) {
-        for (const opt of q.options) {
-          previewLines.push(`  • ${opt.label}: ${opt.description || ''}`)
-        }
-      }
-    }
-    preview = previewLines.join('\n')
-    extraMeta.hookType = 'ask-user-question'
-    extraMeta.questions = toolInput.questions
-  }
-
-  const projectSlug = path.basename(cwd || '').replace(/[^a-zA-Z0-9_-]/g, '_')
-  const sessionSlug = (sessionId || '').replace(/[^a-zA-Z0-9_-]/g, '_')
-  const threadId = `permission_${projectSlug}_${sessionSlug}_${Date.now()}`
-
-  const { approval } = await deps.createApproval({
-    source: approvalSource,
-    toolName,
-    toolInput,
-    toolId: '',
-    cwd,
-    agentName: agentSource,
-    title,
-    body: preview,
-    threadId,
-    metadata: {
-      ...extraMeta,
-      tmuxTarget,
-      sessionLabel: deriveSessionLabel(tmuxTarget),
-      sessionId,
-      agentName: agentSource,
-    },
+  const shaped = normalizePermissionRequestPayload(parsed.value, {
+    tmuxTarget: getString(req.headers['x-tmux-target']),
+    agentSource: getString(req.headers['x-agent-source']),
   })
 
-  deps.spawnLocalNotification(toolName)
+  const { approval } = await deps.createApproval(shaped)
+
+  deps.spawnLocalNotification(shaped.toolName)
 
   // PC側で承認/拒否された場合、Claude Codeが接続を切る → 検知してマーク
   let clientDisconnected = false

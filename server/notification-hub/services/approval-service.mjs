@@ -7,14 +7,76 @@
 // upward from notification-service or routes/* (routes call services, not
 // vice versa).
 import { randomUUID } from 'node:crypto'
+import path from 'node:path'
 import { log } from '../core/log.mjs'
-import { persistedApproval } from '../notification-utils.mjs'
+import { deriveSessionLabel, getString, persistedApproval } from '../notification-utils.mjs'
 import * as store from '../state/store.mjs'
 import { appendJsonl } from '../state/persistence.mjs'
+import { buildToolPreview } from './approval-preview.mjs'
 
 // Re-export so existing callers (routes/hooks) can keep importing from here
 // without breaking the public surface. Pure presentation lives next door.
 export { buildToolPreview } from './approval-preview.mjs'
+
+/**
+ * Normalize a raw permission-request hook payload + headers into the shape
+ * accepted by createApproval. Routes parse HTTP, this service shapes the
+ * domain object — keeps business logic out of routes per the DAG rule.
+ *
+ * @param {{ tool_name?: unknown, tool_input?: unknown, cwd?: unknown, session_id?: unknown }} hookPayload
+ * @param {{ tmuxTarget?: string, agentSource?: string }} headers
+ * @returns Parameters bag matching createApproval's first arg
+ */
+export function normalizePermissionRequestPayload(hookPayload, headers = {}) {
+  const toolName = getString(hookPayload?.tool_name)
+  const toolInput = hookPayload?.tool_input || {}
+  const cwd = getString(hookPayload?.cwd)
+  const sessionId = getString(hookPayload?.session_id)
+  const tmuxTarget = headers.tmuxTarget || ''
+  const agentSource = headers.agentSource === 'codex' ? 'codex' : 'claude-code'
+  const approvalSource = agentSource === 'codex' ? 'codex-hook' : 'claude-code-hook'
+
+  let preview = buildToolPreview(toolName, toolInput)
+  const isAskQ = toolName === 'AskUserQuestion' && Array.isArray(toolInput.questions)
+  const extraMeta = {}
+  if (isAskQ) {
+    const previewLines = []
+    for (const q of toolInput.questions) {
+      previewLines.push(q.question || '')
+      if (Array.isArray(q.options)) {
+        for (const opt of q.options) {
+          previewLines.push(`  • ${opt.label}: ${opt.description || ''}`)
+        }
+      }
+    }
+    preview = previewLines.join('\n')
+    extraMeta.hookType = 'ask-user-question'
+    extraMeta.questions = toolInput.questions
+  }
+
+  const projectSlug = path.basename(cwd || '').replace(/[^a-zA-Z0-9_-]/g, '_')
+  const sessionSlug = (sessionId || '').replace(/[^a-zA-Z0-9_-]/g, '_')
+  const threadId = `permission_${projectSlug}_${sessionSlug}_${Date.now()}`
+
+  return {
+    source: approvalSource,
+    toolName,
+    toolInput,
+    toolId: '',
+    cwd,
+    agentName: agentSource,
+    title: toolName,
+    body: preview,
+    threadId,
+    metadata: {
+      ...extraMeta,
+      tmuxTarget,
+      sessionLabel: deriveSessionLabel(tmuxTarget),
+      sessionId,
+      agentName: agentSource,
+    },
+  }
+}
 
 /**
  * Create a new approval record. Side-effect: also creates a linked
