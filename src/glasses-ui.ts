@@ -26,6 +26,24 @@ type ApprovalRequest = {
   options: string[]
 }
 
+/**
+ * Phase 3: structural-typed mirrors of AgentSession / ProjectMeta from
+ * src/notifications.ts. We use local aliases here to avoid a circular import
+ * (notifications.ts → glasses-ui.ts via store.ts). Only the fields the
+ * SessionList screen actually reads are required.
+ */
+export type AgentSessionLike = {
+  session_id: string
+  label: string
+  status: 'idle' | 'working' | 'permission' | 'done' | 'error'
+}
+
+export type ProjectMetaLike = {
+  project_id: string
+  label: string
+  default_backend: string
+}
+
 /** AskUserQuestion の質問データ（Hub metadata から取得） */
 export type AskQuestionData = {
   question: string
@@ -50,6 +68,9 @@ export type NotificationUIState = {
     | 'voice-command-confirm'
     | 'voice-command-sending'
     | 'voice-command-done'
+    // Phase 3: SessionList (pull-to-new-session) screens
+    | 'session-list'
+    | 'session-list-create-confirm'
   items: NotificationItem[]
   selectedIndex: number
   /** detail画面のページ送り用（fullTextを複数ページに分割） */
@@ -268,7 +289,7 @@ function formatCurrentDateTime(now = new Date()): string {
 export function createGlassesUI() {
   // The host treats startup-page creation as one-time init; later UI changes should use rebuild.
   const startupRenderedBridges = new WeakSet<object>()
-  const layoutByBridge = new WeakMap<object, 'base' | 'text' | 'idle-launcher' | 'approval' | 'notif-list' | 'notif-detail' | 'notif-actions' | 'ask-question' | 'reply-recording' | 'reply-confirm' | 'reply-result' | 'vc-recording' | 'vc-rec-stream' | 'vc-confirm' | 'vc-sending' | 'vc-done'>()
+  const layoutByBridge = new WeakMap<object, 'base' | 'text' | 'idle-launcher' | 'approval' | 'notif-list' | 'notif-detail' | 'notif-actions' | 'ask-question' | 'reply-recording' | 'reply-confirm' | 'reply-result' | 'vc-recording' | 'vc-rec-stream' | 'vc-confirm' | 'vc-sending' | 'vc-done' | 'session-list' | 'session-list-create-confirm'>()
   const bridgeKeyOf = (conn: BridgeConnection) => conn.bridge as unknown as object
 
   // 描画ロック: SDK呼び出しの同時実行を防ぐ（実機で衝突するとG2が固まる）
@@ -1186,6 +1207,132 @@ export function createGlassesUI() {
       })
       layoutByBridge.set(bridgeKeyOf(conn), 'vc-done')
       log(`G2 voice-command 完了表示: ${ok ? 'ok' : 'fail'}`)
+    },
+
+    /**
+     * Phase 3: G2 SessionList screen.
+     *
+     * Layout:
+     *   line 0:  ↓ Pull to create new      (sentinel — selecting + swipe-down opens create-confirm)
+     *   line 1+: ●/○ <label> <status>
+     *
+     * `selectedIndex` 0 == sentinel; 1..N == sessions[selectedIndex - 1].
+     */
+    async showSessionList(
+      conn: BridgeConnection,
+      sessions: AgentSessionLike[],
+      selectedIndex: number,
+      _opts?: { activeSessionId?: string | null },
+    ): Promise<void> {
+      if (!conn.bridge) {
+        log(`[Mock] G2 SessionList: ${sessions.length} sessions selected=${selectedIndex}`)
+        return
+      }
+      const sentinel = '↓ Pull to create new'
+      const itemNames: string[] = [sentinel]
+      for (const s of sessions) {
+        const isWorking = s.status === 'working' || s.status === 'permission'
+        const mark = isWorking ? '●' : '○'
+        const label = s.label || s.session_id.slice(0, 8)
+        const statusBadge = s.status === 'working'
+          ? ' working'
+          : s.status === 'permission'
+            ? ' perm'
+            : s.status === 'error'
+              ? ' err'
+              : s.status === 'done'
+                ? ' done'
+                : ' idle'
+        const raw = `${mark} ${label}${statusBadge}`
+        itemNames.push(truncateByBytes(raw, 45))
+      }
+
+      const headerContainer = new TextContainerProperty({
+        xPosition: 8,
+        yPosition: 8,
+        width: 560,
+        height: 28,
+        containerID: 1,
+        containerName: 'sl-hdr',
+        content: `Sessions (${sessions.length})  ${formatCurrentTime()}`,
+        isEventCapture: 0,
+      })
+
+      const safeIndex = Math.max(0, Math.min(selectedIndex, itemNames.length - 1))
+      const listContainer = new ListContainerProperty({
+        xPosition: 8,
+        yPosition: 42,
+        width: 560,
+        height: 232,
+        containerID: 2,
+        containerName: 'sl-list',
+        itemContainer: new ListItemContainerProperty({
+          itemCount: itemNames.length,
+          itemWidth: 0,
+          isItemSelectBorderEn: 1,
+          itemName: itemNames,
+        }),
+        isEventCapture: 1,
+      })
+
+      await renderStartupPage(conn, {
+        texts: [headerContainer],
+        lists: [listContainer],
+        targetLayout: 'session-list',
+      })
+      layoutByBridge.set(bridgeKeyOf(conn), 'session-list')
+      log(`G2 SessionList表示: ${sessions.length}件 selected=${safeIndex}`)
+    },
+
+    /**
+     * Phase 3: G2 create-confirm overlay — shown after the user pulls down on
+     * the sentinel. Cycles through `projectChoices` via swipe; tap creates,
+     * double-tap cancels, 10s auto-timeout cancels.
+     */
+    async showSessionListCreateConfirm(
+      conn: BridgeConnection,
+      projectChoices: ProjectMetaLike[],
+      selectedProjectIndex: number,
+    ): Promise<void> {
+      if (!conn.bridge) {
+        log(`[Mock] G2 SessionList create-confirm: ${projectChoices.length} projects index=${selectedProjectIndex}`)
+        return
+      }
+      const safe = projectChoices.length > 0
+        ? Math.max(0, Math.min(selectedProjectIndex, projectChoices.length - 1))
+        : 0
+      const choice = projectChoices[safe]
+      const label = choice ? choice.label : '(no projects)'
+      const backend = choice ? choice.default_backend : '-'
+
+      const headerContainer = new TextContainerProperty({
+        xPosition: 8,
+        yPosition: 4,
+        width: 560,
+        height: 64,
+        containerID: 1,
+        containerName: 'sl-cc-hdr',
+        content: `Create new session\n→ ${label}  (${backend})`,
+        isEventCapture: 0,
+      })
+
+      const bodyContainer = new TextContainerProperty({
+        xPosition: 8,
+        yPosition: 72,
+        width: 560,
+        height: 200,
+        containerID: 2,
+        containerName: 'sl-cc-body',
+        content: `(${safe + 1}/${projectChoices.length || 1})\n\nSwipe = cycle / Tap = Create / DblTap = Cancel`,
+        isEventCapture: 1,
+      })
+
+      await renderStartupPage(conn, {
+        texts: [headerContainer, bodyContainer],
+        targetLayout: 'session-list-create-confirm',
+      })
+      layoutByBridge.set(bridgeKeyOf(conn), 'session-list-create-confirm')
+      log(`G2 SessionList create-confirm表示: ${label} (${safe + 1}/${projectChoices.length || 1})`)
     },
 
     /**

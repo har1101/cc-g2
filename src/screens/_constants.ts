@@ -22,3 +22,6 @@ export const VOICE_COMMAND_RECORDING_MAX_MS = 20_000
 
 /** voice-command-done 表示後に自動で idle に戻るまでの時間 */
 export const VOICE_COMMAND_DONE_AUTO_RETURN_MS = 2_000
+
+/** Phase 3: SessionList create-confirm 自動キャンセルまでの時間 */
+export const CREATE_CONFIRM_AUTO_CANCEL_MS = 10_000
