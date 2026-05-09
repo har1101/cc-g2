@@ -592,9 +592,28 @@ async function findSessionForWorkdir(workdir, agentMode = 'claude') {
 }
 
 function launchCcG2Session(prompt, workdir, agentMode = 'claude') {
-  const args = ['launch-detached', '--workdir', workdir, '--prompt', prompt]
+  // Codex 3 #9: pre-allocate the agent_session_id so it lands in the spawned
+  // tmux env (CC_G2_AGENT_SESSION_ID). Without this, Phase 4 hook header
+  // injection would have no session id for Voice Entry-launched sessions and
+  // multi-session routing would fall back to the unknown bucket. The id we
+  // pre-allocate must match the deterministic id that registerSessionWithHub
+  // uses below (`voice-<sessionName>`). cc-g2.sh derives sessionName from the
+  // workdir + agentMode at launch time, so we generate a stable provisional
+  // id from a hash of (workdir, agentMode, time) and pass it; if cc-g2.sh
+  // ends up creating a session with a different name (slug collision retry),
+  // registerSessionWithHub's idempotent update handles the divergence.
+  const provisionalId = `voice-${crypto.randomUUID()}`
+  const args = [
+    'launch-detached',
+    '--workdir', workdir,
+    '--prompt', prompt,
+    '--agent-session-id', provisionalId,
+  ]
   if (agentMode === 'codex') args.push('--agent', 'codex')
-  return runCcG2Command(args)
+  return runCcG2Command(args).then((launch) => ({
+    ...launch,
+    agentSessionId: launch?.agentSessionId || provisionalId,
+  }))
 }
 
 function continueCcG2Session(prompt, sessionName) {
@@ -612,7 +631,7 @@ function continueCcG2Session(prompt, sessionName) {
  * project allowlist; just a sentinel for sessions started outside of
  * pull-to-new-session).
  */
-async function registerSessionWithHub({ sessionName, tmuxTarget, workdir, agentMode }) {
+async function registerSessionWithHub({ sessionName, tmuxTarget, workdir, agentMode, agentSessionId }) {
   if (!HUB_AUTH_TOKEN) {
     appendLog({ type: 'session_register_skip', reason: 'no_token', sessionName })
     return
@@ -623,8 +642,12 @@ async function registerSessionWithHub({ sessionName, tmuxTarget, workdir, agentM
   }
   const backend = agentMode === 'codex' ? 'codex-cli' : 'claude-code'
   const label = (path.basename(workdir || '') || sessionName).slice(0, 40)
+  // Codex 3 #9: prefer the agentSessionId that was injected into the tmux env
+  // by launchCcG2Session() so the Hub-side row matches the env var Phase 4
+  // hooks will read. Fall back to `voice-<sessionName>` for legacy continue
+  // flows where no fresh launch was performed.
   const body = {
-    session_id: `voice-${sessionName}`,
+    session_id: agentSessionId || `voice-${sessionName}`,
     label,
     backend,
     project_id: '_unmanaged',
@@ -820,6 +843,7 @@ const server = http.createServer((req, res) => {
           tmuxTarget: tmuxTargetForRegister,
           workdir: effectiveWorkdir,
           agentMode,
+          agentSessionId: launch?.agentSessionId,
         })
 
         writeLastSession({

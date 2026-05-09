@@ -49,11 +49,28 @@ export async function appendJsonl(filePath, obj) {
 /**
  * Atomically write a JSON snapshot via tmp file + rename.
  * Used by sessions.json (Phase 3) where we always want the full current view.
+ *
+ * Codex 3 #4: two concurrent calls to the same `filePath` shared the same
+ * `${filePath}.tmp` and could race at the filesystem layer. We now serialize
+ * writes per-`filePath` through an in-memory promise chain so a stale earlier
+ * snapshot can't overwrite a newer one. (Cross-process serialization would
+ * require flock; Phase 3 runs single-process so the in-memory chain is enough.)
  */
+const snapshotChains = new Map()
 export async function writeJsonSnapshot(filePath, obj) {
-  const tmp = `${filePath}.tmp`
-  await writeFile(tmp, `${JSON.stringify(obj, null, 2)}\n`, 'utf8')
-  await rename(tmp, filePath)
+  const prev = snapshotChains.get(filePath) || Promise.resolve()
+  const next = prev.then(async () => {
+    const tmp = `${filePath}.tmp`
+    await writeFile(tmp, `${JSON.stringify(obj, null, 2)}\n`, 'utf8')
+    await rename(tmp, filePath)
+  })
+  // Keep the chain alive but don't hold onto rejections — clear on settle.
+  const tracked = next.catch(() => {})
+  snapshotChains.set(filePath, tracked)
+  tracked.then(() => {
+    if (snapshotChains.get(filePath) === tracked) snapshotChains.delete(filePath)
+  })
+  return next
 }
 
 async function loadJsonSnapshot(filePath) {

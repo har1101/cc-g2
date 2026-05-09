@@ -195,7 +195,13 @@ exec ${JSON.stringify(process.execPath)} ${JSON.stringify(claudeStub)} "$@"
       project_id: '_unmanaged',
       source: 'voice-entry',
     })
-    expect(last.session_id).toMatch(/^voice-g2-alpha-tool-stub/)
+    // Phase 3 Codex #9: voice-entry now pre-allocates an agentSessionId
+    // (`voice-<uuid>`) and threads it through launchCcG2Session as
+    // --agent-session-id, so the registered session_id matches the env var
+    // CC_G2_AGENT_SESSION_ID injected into the spawned tmux session. The
+    // legacy `voice-<sessionName>` form is only used as a fallback when no
+    // agentSessionId is available (e.g. continue-existing flows).
+    expect(last.session_id).toMatch(/^voice-[0-9a-f-]{36}$/)
     expect(last.tmux_target).toMatch(/^g2-alpha-tool-stub.*:0\.0$/)
   })
 })

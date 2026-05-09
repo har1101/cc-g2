@@ -221,6 +221,14 @@ export function createSessionService(cfg) {
     const tmux_target = typeof input.tmux_target === 'string' ? input.tmux_target.trim() : ''
     const source = typeof input.source === 'string' && VALID_SOURCES.has(input.source) ? input.source : 'manual'
     if (!session_id) throw new ValidationError('session_id required')
+    // Codex 3 #5: validate session_id shape so an authenticated client cannot
+    // hijack an existing UUID-style session by POSTing /register with the same
+    // id. UUIDs from createSession use lowercase hex + dashes; voice-entry
+    // uses `voice-<sessionName>` (alnum + dash + underscore). Reject anything
+    // that doesn't match either convention.
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(session_id)) {
+      throw new ValidationError('session_id must match /^[A-Za-z0-9_-]{1,128}$/')
+    }
     if (!label) throw new ValidationError('label required')
     if (!ALLOWED_BACKENDS.has(backend)) throw new ValidationError('backend must be claude-code or codex-cli')
     if (!project_id) throw new ValidationError('project_id required')
@@ -228,6 +236,17 @@ export function createSessionService(cfg) {
 
     const now = new Date().toISOString()
     const existing = store.sessions.get(session_id)
+    // Codex 3 #5: registerSession is idempotent for `voice-entry` and `manual`
+    // sources (re-spawning Voice Entry should update the row), but creating a
+    // session via POST /api/v1/sessions creates a `pull-to-new-session` row
+    // owned by the Hub. Reject any register attempt that tries to overwrite
+    // a `pull-to-new-session` row from a different source — that path should
+    // only be mutated by activateSession or future updateStatus.
+    if (existing && existing.source === 'pull-to-new-session' && source !== 'pull-to-new-session') {
+      throw new ValidationError(
+        `session_id ${session_id} owned by pull-to-new-session; cannot overwrite from source=${source}`,
+      )
+    }
     /** @type {import('../state/store.mjs').AgentSession} */
     const session = existing
       ? {
