@@ -18,7 +18,6 @@ import { isPublicApiRequest, requireApiAuth as coreRequireApiAuth } from './core
 import { bootstrap as persistenceBootstrap, buildPaths } from './state/persistence.mjs'
 import {
   addNotification as notificationServiceAdd,
-  forwardReplyIfConfigured,
   processReply as notificationServiceProcessReply,
 } from './services/notification-service.mjs'
 import {
@@ -104,7 +103,6 @@ const processReply = (input) =>
   notificationServiceProcessReply(input, {
     matchPendingApprovalForReply: approvalServiceMatchForReply,
     resolveApproval,
-    forwardReplyIfConfigured,
     relayReplyIfConfigured,
     repliesFile,
   })
@@ -154,7 +152,6 @@ const deps = {
   cleanupApprovalOnDisconnect,
   waitForApprovalDecision,
   buildHookResponseFromApproval,
-  forwardReplyIfConfigured,
   relayReplyIfConfigured,
   processReply,
   spawnLocalNotification,

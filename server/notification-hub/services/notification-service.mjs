@@ -157,10 +157,15 @@ export async function persistReply(record, cfg) {
  * @param {{
  *   matchPendingApprovalForReply: (params: { replyText: string, notification: import('../state/store.mjs').NotificationItem }) => import('../state/store.mjs').ApprovalRecord | null,
  *   resolveApproval: (id: string, decision: 'approve'|'deny', comment: string|undefined, decidedBy: string|undefined) => unknown,
- *   forwardReplyIfConfigured: (params: { reply: import('../state/store.mjs').ReplyRecord, notification: any }) => Promise<{ status: string, error?: string }>,
  *   relayReplyIfConfigured: (params: { reply: import('../state/store.mjs').ReplyRecord, notification: any }) => Promise<{ status: string, error?: string }>,
  *   repliesFile: string,
  * }} cfg
+ *
+ * Note: forwardReplyIfConfigured is the local export in this same module —
+ * called directly, not injected, since it lives in the same notification
+ * service. relayReplyIfConfigured is injected because it lives in transport/.
+ * matchPendingApprovalForReply / resolveApproval are injected because they
+ * belong to approval-service (DAG: notification-service must not import it).
  * @returns {Promise<{ status: number, body: any }>}
  */
 export async function processReply(input, cfg) {
@@ -330,7 +335,7 @@ export async function processReply(input, cfg) {
     record.result = 'relayed'
   }
 
-  const fwd = await cfg.forwardReplyIfConfigured({
+  const fwd = await forwardReplyIfConfigured({
     reply: record,
     notification: {
       id: item.id,
