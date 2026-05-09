@@ -350,6 +350,7 @@ launch_tmux_session_detached() {
   local work_dir="$1"
   local prompt="$2"
   local agent_mode="$3"
+  local agent_session_id="${4:-${CC_G2_AGENT_SESSION_ID:-}}"
   local session_name="$(make_unique_tmux_session_name "$work_dir" "$agent_mode")"
   local tmux_env=(
     -e _CC_G2_INSIDE=1
@@ -358,6 +359,12 @@ launch_tmux_session_detached() {
     -e CC_G2_ENABLE_STATUSLINE="${ENABLE_STATUSLINE}"
     -e CC_G2_ORIG_STATUSLINE_CMD="${ORIG_STATUSLINE_CMD}"
   )
+  # Phase 3: propagate the Hub-supplied AgentSession id into the new tmux
+  # session so the inner agent process can attach the X-CC-G2-Agent-Session
+  # header (Phase 4 will use this for multi-session routing).
+  if [ -n "$agent_session_id" ]; then
+    tmux_env+=( -e "CC_G2_AGENT_SESSION_ID=${agent_session_id}" )
+  fi
   local nested_args=()
   if [ "$agent_mode" = "codex" ]; then
     nested_args+=("--codex")
@@ -375,7 +382,16 @@ launch_tmux_session_detached() {
   tmux new-session -d -s "$session_name" -c "$work_dir" \
     "${tmux_env[@]}" \
     "$nested_cmd"
-  json_out --arg sessionName "$session_name" --arg tmuxTarget "${session_name}:0.0" --arg workdir "$work_dir" '{ok:true,sessionName:$sessionName,tmuxTarget:$tmuxTarget,workdir:$workdir}'
+  if [ -n "$agent_session_id" ]; then
+    json_out \
+      --arg sessionName "$session_name" \
+      --arg tmuxTarget "${session_name}:0.0" \
+      --arg workdir "$work_dir" \
+      --arg agentSessionId "$agent_session_id" \
+      '{ok:true,sessionName:$sessionName,tmuxTarget:$tmuxTarget,workdir:$workdir,agentSessionId:$agentSessionId}'
+  else
+    json_out --arg sessionName "$session_name" --arg tmuxTarget "${session_name}:0.0" --arg workdir "$work_dir" '{ok:true,sessionName:$sessionName,tmuxTarget:$tmuxTarget,workdir:$workdir}'
+  fi
 }
 
 send_to_tmux_session() {
@@ -397,17 +413,19 @@ run_internal_command() {
       local work_dir=""
       local prompt=""
       local agent_mode="claude"
+      local agent_session_id="${CC_G2_AGENT_SESSION_ID:-}"
       while [ $# -gt 0 ]; do
         case "$1" in
           --workdir) work_dir="$2"; shift 2 ;;
           --prompt) prompt="$2"; shift 2 ;;
           --agent) agent_mode="$2"; shift 2 ;;
+          --agent-session-id) agent_session_id="$2"; shift 2 ;;
           codex|--codex|--native-codex|-codex) agent_mode="codex"; shift ;;
           *) error "Unknown launch-detached arg: $1"; exit 1 ;;
         esac
       done
       [ -n "$work_dir" ] || { error "launch-detached requires --workdir"; exit 1; }
-      launch_tmux_session_detached "$work_dir" "$prompt" "$agent_mode"
+      launch_tmux_session_detached "$work_dir" "$prompt" "$agent_mode" "$agent_session_id"
       exit 0
       ;;
     send)
