@@ -1,8 +1,7 @@
 // /api/approvals (POST/GET), /api/approvals/:id (GET), /api/approvals/:id/decide (POST)
 import { getString, readRequestBody, safeJsonParse } from '../notification-utils.mjs'
 import { isBodyTooLargeError, sendJson, sendRequestBodyTooLarge } from '../core/http.mjs'
-import * as store from '../state/store.mjs'
-import { listPendingApprovals } from '../services/approval-service.mjs'
+import { getApproval, listPendingApprovals } from '../services/approval-service.mjs'
 
 function matchApprovalPath(pathname) {
   const m = pathname.match(/^\/api\/approvals\/([^/]+)$/)
@@ -68,7 +67,7 @@ export async function handle(req, res, ctx) {
   if (method === 'GET') {
     const approvalId = matchApprovalPath(pathname)
     if (approvalId) {
-      const record = store.approvalsById.get(approvalId)
+      const record = getApproval(approvalId)
       if (!record) {
         sendJson(res, 404, { ok: false, error: 'Approval not found' })
         return true
@@ -81,7 +80,7 @@ export async function handle(req, res, ctx) {
   if (method === 'POST') {
     const approvalId = matchApprovalDecidePath(pathname)
     if (approvalId) {
-      const record = store.approvalsById.get(approvalId)
+      const record = getApproval(approvalId)
       if (!record) {
         sendJson(res, 404, { ok: false, error: 'Approval not found' })
         return true

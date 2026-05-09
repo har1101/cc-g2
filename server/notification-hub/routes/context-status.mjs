@@ -1,7 +1,7 @@
 // /api/context-status (POST from StatusLine hook; GET to read all sessions)
-import { getString, readRequestBody, safeJsonParse } from '../notification-utils.mjs'
+import { readRequestBody, safeJsonParse } from '../notification-utils.mjs'
 import { isBodyTooLargeError, sendJson, sendRequestBodyTooLarge } from '../core/http.mjs'
-import { contextStatusBySession } from '../state/store.mjs'
+import { listContextStatuses, recordContextStatus } from '../services/context-status-service.mjs'
 
 export async function handle(req, res, ctx) {
   const { method, pathname, deps } = ctx
@@ -22,21 +22,13 @@ export async function handle(req, res, ctx) {
       sendJson(res, 400, { ok: false, error: 'Invalid JSON body' })
       return true
     }
-    const p = parsed.value
-    const sessionId = getString(p.sessionId, 'default')
-    contextStatusBySession.set(sessionId, {
-      sessionId,
-      cwd: getString(p.cwd),
-      usedPercentage: typeof p.usedPercentage === 'number' ? p.usedPercentage : 0,
-      model: getString(p.model),
-      updatedAt: new Date().toISOString(),
-    })
+    recordContextStatus(parsed.value)
     sendJson(res, 200, { ok: true })
     return true
   }
 
   if (method === 'GET' && pathname === '/api/context-status') {
-    sendJson(res, 200, { ok: true, sessions: [...contextStatusBySession.values()] })
+    sendJson(res, 200, { ok: true, sessions: listContextStatuses() })
     return true
   }
   return false
