@@ -21,6 +21,7 @@ import {
   type ContextSession,
 } from './state/store'
 import { createAudioSession, type AudioSession, type AudioSessionHandle } from './audio-session'
+import { createRenderQueue, type RenderQueue } from './render-queue'
 
 const appRoot = document.querySelector<HTMLDivElement>('#app')!
 const uiSearch = new URLSearchParams(globalThis.location?.search || '')
@@ -125,6 +126,33 @@ let audioSession: AudioSession | null = null
 let currentReplyAudioHandle: AudioSessionHandle | null = null
 let currentVoiceAudioHandle: AudioSessionHandle | null = null
 let currentDevAudioHandle: AudioSessionHandle | null = null
+
+/**
+ * G2 描画ジョブを直列化する render queue (Phase 1.5b)。
+ * `glassesUI` 自身が内部 lock を持っているため、 ここでの直列化は冗長に見えるが、
+ * 1.5c 以降の screen 分割で「複数 screen が同時に describe される」 状況での
+ * 唯一の真実の source にする目的で先に導入する。
+ *
+ * NOTE: 1.5b では既存の `glassesUI.show*` を全箇所ラップしない (behavior 不変が
+ * 第一の goal であり、 既存の SDK 内部 lock で十分機能しているため)。 1.5c で
+ * screen module が増えたタイミングで `renderQueue.enqueue` 経由に揃える。
+ */
+const renderQueue: RenderQueue = createRenderQueue({
+  log: (msg) => log(msg),
+  // safeguard: 連続 throw が 3 回続いたら idle launcher に戻す。
+  // connection が確定していない可能性があるので nullable check する。
+  safeguard: async () => {
+    if (!connection) return
+    try {
+      await glassesUI.showIdleLauncher(connection, { dimMode: appConfig.notificationIdleDimMode })
+    } catch { /* swallow — render-queue は次の job に進む */ }
+  },
+})
+
+/** glasses-ui か render-queue のどちらかが進行中なら true。 イベント保留判定に使う */
+function isAnyRendering(): boolean {
+  return glassesUI.isRendering() || renderQueue.isRendering()
+}
 
 const DETAIL_SCROLL_COOLDOWN_MS = 250
 const TAP_SCROLL_SUPPRESS_MS = 150
@@ -546,7 +574,7 @@ function canAutoOpenForScreen(screen: NotificationUIState['screen']): boolean {
 }
 
 async function flushPendingNotificationUi(reason: string) {
-  if (!connection || glassesUI.isRendering()) return
+  if (!connection || isAnyRendering()) return
 
   if (store.dashboard.pendingAutoOpenOnNew && appConfig.notificationAutoOpenOnNew && canAutoOpenForScreen(notifState.screen)) {
     // idle画面で待機中の single-tap タイマーがあればキャンセルしてから list へ遷移する
@@ -575,7 +603,7 @@ function startNotificationPolling() {
     fetchContextStatus()
     await flushPendingNotificationUi('polling')
     // 描画中はスキップ（SDK呼び出し衝突防止）
-    if (glassesUI.isRendering()) return
+    if (isAnyRendering()) return
     try {
       const items = await notifClient.list(20)
       store.dashboard.hubReachable = true
@@ -591,7 +619,7 @@ function startNotificationPolling() {
       const statusEl = document.getElementById('notif-status')!
       statusEl.textContent = `${items.length}件 (自動更新)`
       const wantsAutoOpen = hasNewItems && appConfig.notificationAutoOpenOnNew
-      const canAutoOpenNow = wantsAutoOpen && canAutoOpenForScreen(notifState.screen) && !glassesUI.isRendering()
+      const canAutoOpenNow = wantsAutoOpen && canAutoOpenForScreen(notifState.screen) && !isAnyRendering()
 
       // 新着が来た時点で pending を立てておく。
       // これにより reply-sending 等で一度スキップしても、画面復帰後の次サイクルで回収できる。
@@ -611,7 +639,7 @@ function startNotificationPolling() {
         await glassesUI.showNotificationList(connection!, items)
         store.dashboard.pendingAutoOpenOnNew = false
         log(`通知自動更新: ${items.length}件 (新着検知で自動表示)`)
-      } else if (notifState.screen === 'list' && !glassesUI.isRendering()) {
+      } else if (notifState.screen === 'list' && !isAnyRendering()) {
         // ユーザー操作直後はリスト再描画を遅延し、連続rebuild競合を抑える
         if (Date.now() - store.dashboard.lastG2UserEventAt < 4000) {
           log(`通知自動更新: ${items.length}件 (操作中のため描画保留)`)
@@ -706,7 +734,7 @@ document.getElementById('notif-fetch-btn')!.addEventListener('click', async () =
     notifState.selectedIndex = 0
     if (notifState.screen !== 'list') {
       notifState.screen = 'idle'
-      if (connection && !glassesUI.isRendering()) {
+      if (connection && !isAnyRendering()) {
         await glassesUI.showIdleLauncher(connection, { dimMode: appConfig.notificationIdleDimMode })
       }
     }
@@ -1076,7 +1104,7 @@ function queuePendingNotifEvent(conn: BridgeConnection, event: EvenHubEvent) {
   if (store.eventQueue.pendingNotifEventFlushTimer) return
   store.eventQueue.pendingNotifEventFlushTimer = setTimeout(() => {
     store.eventQueue.pendingNotifEventFlushTimer = null
-    if (glassesUI.isRendering() || store.eventQueue.notifEventInFlight || !store.eventQueue.pendingNotifEvent) {
+    if (isAnyRendering() || store.eventQueue.notifEventInFlight || !store.eventQueue.pendingNotifEvent) {
       if (store.eventQueue.pendingNotifEvent) queuePendingNotifEvent(conn, store.eventQueue.pendingNotifEvent)
       return
     }
@@ -1145,7 +1173,7 @@ async function handleNotifEvent(conn: BridgeConnection, event: EvenHubEvent) {
           return
         }
         if (isTapLikeEvent) store.idle.lastIdleEventAt = now
-        if (glassesUI.isRendering()) {
+        if (isAnyRendering()) {
           if (!isTapLikeEvent) return
           store.idle.idleTapDuringRender = true
           log(`[event] idle描画中 (保留フラグON)`)
@@ -1187,7 +1215,7 @@ async function handleNotifEvent(conn: BridgeConnection, event: EvenHubEvent) {
             log('voice-command: 開始キャンセル (録音中)')
             return
           }
-          if (glassesUI.isRendering()) {
+          if (isAnyRendering()) {
             log('voice-command: 開始キャンセル (描画中)')
             return
           }
@@ -1196,7 +1224,7 @@ async function handleNotifEvent(conn: BridgeConnection, event: EvenHubEvent) {
         return
       }
 
-      if (glassesUI.isRendering()) {
+      if (isAnyRendering()) {
         log('[event] 描画中のため保留')
         queuePendingNotifEvent(conn, event)
         return
@@ -1707,7 +1735,7 @@ async function handleNotifEvent(conn: BridgeConnection, event: EvenHubEvent) {
       }
   } finally {
     store.eventQueue.notifEventInFlight = false
-    if (store.eventQueue.pendingNotifEvent && !glassesUI.isRendering()) {
+    if (store.eventQueue.pendingNotifEvent && !isAnyRendering()) {
       queuePendingNotifEvent(conn, store.eventQueue.pendingNotifEvent)
     }
   }
