@@ -124,6 +124,8 @@ let voiceCommandStartedAt = 0
 let voiceCommandFinalText = ''
 let voiceCommandRecordingMaxTimer: ReturnType<typeof setTimeout> | null = null
 let voiceCommandDoneTimer: ReturnType<typeof setTimeout> | null = null
+// 送信中にユーザーが double-tap で強制 idle 復帰した場合に true。await 後の画面遷移で参照する
+let voiceCommandSendCancelled = false
 let lastIdleEventAt = 0
 let idleTapDuringRender = false
 let idleOpenBlockedUntil = 0
@@ -579,6 +581,8 @@ async function flushPendingNotificationUi(reason: string) {
   if (!connection || glassesUI.isRendering()) return
 
   if (pendingAutoOpenOnNew && appConfig.notificationAutoOpenOnNew && canAutoOpenForScreen(notifState.screen)) {
+    // idle画面で待機中の single-tap タイマーがあればキャンセルしてから list へ遷移する
+    cancelPendingIdleSingleTap()
     notifState.screen = 'list'
     notifState.selectedIndex = 0
     await glassesUI.showNotificationList(connection, notifState.items)
@@ -632,6 +636,8 @@ function startNotificationPolling() {
       }
 
       if (canAutoOpenNow) {
+        // idle画面で待機中の single-tap タイマーがあればキャンセルしてから list へ遷移する
+        cancelPendingIdleSingleTap()
         notifState.screen = 'list'
         notifState.selectedIndex = 0
         await glassesUI.showNotificationList(connection!, items)
@@ -948,6 +954,8 @@ async function sendVoiceCommandAndShowResult() {
     await returnToIdleFromVoiceCommand('empty-text-send')
     return
   }
+  // 新規送信開始時にキャンセルフラグをリセット
+  voiceCommandSendCancelled = false
   notifState.screen = 'voice-command-sending'
   await glassesUI.showVoiceCommandSending(connection)
   updateNotifInfo()
@@ -961,6 +969,12 @@ async function sendVoiceCommandAndShowResult() {
     const msg = err instanceof Error ? err.message : String(err)
     log(`voice-command 送信失敗: ${msg}`)
     ok = false
+  }
+
+  // await 中にユーザーが double-tap で強制 idle 復帰していたら結果画面をスキップ
+  if (notifState.screen !== 'voice-command-sending' || voiceCommandSendCancelled) {
+    log('voice-command: send result discarded (user cancelled)')
+    return
   }
 
   notifState.screen = 'voice-command-done'
@@ -1600,6 +1614,15 @@ async function handleNotifEvent(conn: BridgeConnection, event: EvenHubEvent) {
           return
         }
       } else if (notifState.screen === 'voice-command-sending') {
+        // 送信中: double-tap のみ "force return to idle" として受け付ける
+        // (15s relay timeout に張り付くのを避けるための退避経路)
+        if (isDoubleTapEventType(eventType)) {
+          log('voice-command: 送信中に double tap → 強制 idle 復帰')
+          cancelPendingIdleSingleTap()
+          voiceCommandSendCancelled = true
+          await returnToIdleFromVoiceCommand('user-cancel-during-send')
+          return
+        }
         log('voice-command: 送信中の入力を無視')
       } else if (notifState.screen === 'voice-command-done') {
         clearVoiceCommandDoneTimer()
@@ -1624,6 +1647,8 @@ document.getElementById('notif-show-g2-btn')!.addEventListener('click', async ()
   }
 
   ensureNotifEventHandler(connection)
+  // idle画面で待機中の single-tap タイマーがあればキャンセルしてから list へ遷移する
+  cancelPendingIdleSingleTap()
   notifState.screen = 'list'
   notifState.selectedIndex = 0
   await glassesUI.showNotificationList(connection, notifState.items)
