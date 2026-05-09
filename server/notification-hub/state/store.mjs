@@ -70,3 +70,87 @@ export function getActiveSessionId() {
 export function setActiveSessionId(id) {
   _activeSessionId = id
 }
+
+// ---------------------------------------------------------------------------
+// Phase 4: per-session indexing helpers.
+//
+// We keep the existing flat arrays (`notifications`, `approvals`, ...) as the
+// canonical source of truth — splitting storage in-place would force every
+// existing route + persistence path to migrate. Instead Phase 4 stamps each
+// approval-linked notification with `metadata.agentSessionId` and the helpers
+// below do the per-session filtering on read.
+//
+// Helpers live in store.mjs (not session-service) so the DAG remains
+// notification/approval/session-router → store with no upward edges.
+// ---------------------------------------------------------------------------
+
+/**
+ * Pull `metadata.agentSessionId` off a notification when present. Returns the
+ * trimmed string or null. Centralised so the comparison logic stays consistent
+ * across routes/services.
+ * @param {NotificationItem | null | undefined} item
+ * @returns {string | null}
+ */
+function notificationSessionId(item) {
+  const v = item && item.metadata ? item.metadata.agentSessionId : null
+  if (typeof v !== 'string') return null
+  const trimmed = v.trim()
+  return trimmed ? trimmed : null
+}
+
+/**
+ * List notifications belonging to a specific AgentSession id. Order matches
+ * `services/notification-service.listNotifications` (newest first, by
+ * createdAt). When sessionId is `null`, all notifications are returned.
+ *
+ * @param {string | null} sessionId
+ * @returns {NotificationItem[]}
+ */
+export function listNotificationsForSession(sessionId) {
+  const sorted = [...notifications].sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))
+  if (!sessionId) return sorted
+  return sorted.filter((item) => notificationSessionId(item) === sessionId)
+}
+
+/**
+ * List pending approvals scoped to a single AgentSession id. When sessionId
+ * is `null`, all pending approvals are returned (legacy behaviour).
+ *
+ * @param {string | null} sessionId
+ * @returns {ApprovalRecord[]}
+ */
+export function listPendingApprovalsForSession(sessionId) {
+  const out = []
+  for (const a of approvals) {
+    if (a.status !== 'pending') continue
+    if (!sessionId) {
+      out.push(a)
+      continue
+    }
+    const n = notificationsById.get(a.notificationId)
+    if (n && notificationSessionId(n) === sessionId) out.push(a)
+  }
+  return out
+}
+
+/**
+ * Build a map of session_id → pending-approval count, excluding the supplied
+ * activeSessionId (used by SessionList to render `(N pending)` badges on
+ * non-active rows). Notifications without an agentSessionId are bucketed
+ * under the literal id 'unknown' and surfaced like any other session.
+ *
+ * @param {string | null} activeSessionId
+ * @returns {Map<string, number>}
+ */
+export function pendingApprovalCountByOtherSessions(activeSessionId) {
+  /** @type {Map<string, number>} */
+  const counts = new Map()
+  for (const a of approvals) {
+    if (a.status !== 'pending') continue
+    const n = notificationsById.get(a.notificationId)
+    const sid = notificationSessionId(n) || 'unknown'
+    if (activeSessionId && sid === activeSessionId) continue
+    counts.set(sid, (counts.get(sid) || 0) + 1)
+  }
+  return counts
+}
