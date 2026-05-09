@@ -44,6 +44,12 @@ export const config = {
   hubPersistToolInput: boolFromEnv('HUB_PERSIST_TOOL_INPUT'),
   groqApiKey: String(process.env.GROQ_API_KEY || '').trim(),
   groqModelDefault: String(process.env.GROQ_MODEL || 'whisper-large-v3').trim(),
+  // Phase 2: Deepgram streaming. Empty apiKey → engine refuses to start with
+  // code 'no_api_key'; the frontend should fall back to groq-batch in that
+  // case (handled by VITE_STT_ENGINE_VOICE_COMMAND env).
+  deepgramApiKey: String(process.env.DEEPGRAM_API_KEY || '').trim(),
+  deepgramModel: String(process.env.DEEPGRAM_MODEL || 'nova-3').trim(),
+  deepgramLanguage: String(process.env.DEEPGRAM_LANGUAGE || 'ja').trim(),
   hubReplyRelayCmd: String(process.env.HUB_REPLY_RELAY_CMD || '').trim(),
   hubReplyRelayTimeoutMs: Math.max(
     1000,
