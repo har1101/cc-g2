@@ -21,6 +21,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 HUB_PORT="${HUB_PORT:-8787}"
 HUB_URL="${HUB_URL:-http://127.0.0.1:${HUB_PORT}}"
 CC_G2_TMUX_TARGET="${CC_G2_TMUX_TARGET:-}"
+CC_G2_AGENT_SESSION_ID="${CC_G2_AGENT_SESSION_ID:-}"
 
 # HUB_AUTH_TOKEN: 環境変数がなければトークンファイルから自動検出
 HUB_AUTH_TOKEN="${HUB_AUTH_TOKEN:-}"
@@ -87,6 +88,10 @@ fi
 
 if [ -n "$CC_G2_TMUX_TARGET" ]; then
   CURL_ARGS+=(-H "X-Tmux-Target: ${CC_G2_TMUX_TARGET}")
+fi
+
+if [ -n "$CC_G2_AGENT_SESSION_ID" ]; then
+  CURL_ARGS+=(-H "X-Agent-Session-Id: ${CC_G2_AGENT_SESSION_ID}")
 fi
 
 CURL_ARGS+=(-d "$PAYLOAD")
