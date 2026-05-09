@@ -24,7 +24,7 @@ export { buildToolPreview } from './approval-preview.mjs'
  * domain object — keeps business logic out of routes per the DAG rule.
  *
  * @param {{ tool_name?: unknown, tool_input?: unknown, cwd?: unknown, session_id?: unknown }} hookPayload
- * @param {{ tmuxTarget?: string, agentSource?: string }} headers
+ * @param {{ tmuxTarget?: string, agentSource?: string, agentSessionId?: string }} headers
  * @returns Parameters bag matching createApproval's first arg
  */
 export function normalizePermissionRequestPayload(hookPayload, headers = {}) {
@@ -35,6 +35,12 @@ export function normalizePermissionRequestPayload(hookPayload, headers = {}) {
   const tmuxTarget = headers.tmuxTarget || ''
   const agentSource = headers.agentSource === 'codex' ? 'codex' : 'claude-code'
   const approvalSource = agentSource === 'codex' ? 'codex-hook' : 'claude-code-hook'
+  // Phase 4: AgentSession id surfaced via header (resolved by routes/* using
+  // services/session-router.resolveSessionId). Default to 'unknown' so
+  // legacy hooks without the header still bucket deterministically.
+  const agentSessionId = typeof headers.agentSessionId === 'string' && headers.agentSessionId
+    ? headers.agentSessionId
+    : 'unknown'
 
   let preview = buildToolPreview(toolName, toolInput)
   const isAskQ = toolName === 'AskUserQuestion' && Array.isArray(toolInput.questions)
@@ -74,6 +80,10 @@ export function normalizePermissionRequestPayload(hookPayload, headers = {}) {
       sessionLabel: deriveSessionLabel(tmuxTarget),
       sessionId,
       agentName: agentSource,
+      // Phase 4: per-session routing key. Populated on every approval-bound
+      // notification so listNotificationsForSession / pendingApprovalCount...
+      // can partition the in-memory store cheaply.
+      agentSessionId,
     },
   }
 }
