@@ -41,11 +41,13 @@ import * as clientEventsRoute from './routes/client-events.mjs'
 import * as locationRoute from './routes/location.mjs'
 import * as contextStatusRoute from './routes/context-status.mjs'
 import * as commandRoute from './routes/command.mjs'
+import * as sessionsRoute from './routes/sessions.mjs'
 import * as uiRoute from './routes/ui.mjs'
 import { attachSttStreamWss } from './routes/stt-stream.mjs'
 import { createDeepgramEngine } from './stt/deepgram-engine.mjs'
+import { createSessionService, loadProjectAllowlist } from './services/session-service.mjs'
 
-const { notificationsFile, repliesFile, clientEventsFile, approvalsFile } = buildPaths({
+const { notificationsFile, repliesFile, clientEventsFile, approvalsFile, sessionsFile } = buildPaths({
   dataDir: config.dataDir,
 })
 
@@ -134,8 +136,14 @@ const routeHandlers = [
   commandRoute.handle,
   approvalsRoute.handle,
   notificationsRoute.handle,
+  sessionsRoute.handle,
   uiRoute.handle,
 ]
+
+// Phase 3 session-service is wired below after persistence bootstrap; we
+// declare a holder here so the deps closure can pick it up without ordering
+// hassle (createSessionService needs the loaded allowlist).
+let sessionService = null
 
 const deps = {
   hubAuthToken: config.hubAuthToken,
@@ -157,6 +165,9 @@ const deps = {
   relayReplyIfConfigured,
   processReply,
   spawnLocalNotification,
+  // session-service is set after bootstrap; routes/sessions.mjs reads via
+  // ctx.deps.sessionService at handle-time so the late wiring is safe.
+  get sessionService() { return sessionService },
 }
 
 const handler = async (req, res) => {
@@ -195,7 +206,23 @@ await persistenceBootstrap({
   notificationsFile,
   repliesFile,
   approvalsFile,
+  sessionsFile,
 })
+
+// Phase 3: load project allowlist + create the session service. The service
+// is exposed via deps.sessionService (lazy getter) so the dispatcher picks it
+// up without re-wiring.
+const projects = await loadProjectAllowlist({ projectsFile: config.projectsFile })
+sessionService = createSessionService({
+  projects,
+  sessionsFile,
+  ccG2ScriptPath: config.ccG2ScriptPath,
+})
+try {
+  await sessionService.validateTmuxTargets()
+} catch (err) {
+  log(`[hub] validateTmuxTargets failed at bootstrap: ${err instanceof Error ? err.message : String(err)}`)
+}
 
 const bindHosts = resolveBindHosts()
 const servers = bindHosts.map((bindHost) => {
