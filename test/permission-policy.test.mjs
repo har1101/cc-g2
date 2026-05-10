@@ -50,6 +50,18 @@ const HARD_DENY_FIXTURES = [
   'PASSWORD=hunter2 deploy.sh',
   'API_KEY=xxx ./run.sh',
   'env DB_PASSWORD=hunter2 psql',
+  // Phase 5 Codex pass: bash -c / sh -c / eval / subshell wrappers
+  'bash -c "sudo apt update"',
+  'sh -c "rm -rf /"',
+  '/bin/bash -c "git push origin main; sudo whoami"',
+  'eval "sudo whoami"',
+  '(sudo apt update)',
+  // mixed segments — wrapper bypass inside an OR/AND chain
+  'echo hi && bash -c "sudo apt"',
+  // npx / npm exec wrapper-stripping bypass
+  'npx rm -rf /',
+  'npm exec rm -rf /',
+  'pnpm exec rm -rf /',
 ]
 
 const DESTRUCTIVE_FIXTURES = [
@@ -86,6 +98,13 @@ const DESTRUCTIVE_FIXTURES = [
   'mysqldump --all-databases > backup.sql',
   // aws s3 rm recursive (non-prod still destructive)
   'aws s3 rm s3://my-bucket/path/ --recursive',
+  // Phase 5 Codex pass: wrapper recursion preserves destructive verdicts
+  '/bin/bash -c "git push origin main"',
+  'eval "rm -rf dist"',
+  '(rm -rf dist)',
+  'npx git push origin main',
+  // chained reset+push covered by segment-OR + wrapper recursion
+  'git reset --hard HEAD~3 && git push --force',
 ]
 
 const NORMAL_FIXTURES = [

@@ -137,6 +137,13 @@ export function tokenizeBash(cmd) {
       // iteration — they'll just appear as a separate "token" we ignore.
       continue
     }
+    // Subshell delimiters: emit `(` and `)` as standalone tokens so the
+    // segment classifier can recognise `(sudo cmd)` and recurse into it.
+    if (ch === '(' || ch === ')') {
+      flushToken()
+      argv.push(ch)
+      continue
+    }
     buf += ch
     hasToken = true
   }
@@ -366,14 +373,89 @@ function isMysqldumpAll(argv) {
   return argvIncludes(argv, '--all-databases')
 }
 
+// ---------------------------------------------------------------------------
+// Wrapper-command recursion (Phase 5 Codex pass)
+// ---------------------------------------------------------------------------
+
+/**
+ * Identify a wrapper command that takes a quoted shell-string argument we
+ * should recurse into. Returns the inner command string, or null if the
+ * head is not such a wrapper.
+ *
+ * Recognises:
+ *   bash -c "<cmd>" / sh -c "<cmd>" (with optional flags before -c)
+ *   eval "<cmd>" / eval cmd args... (joins argv[1..] with spaces)
+ *
+ * Without this recursion, `bash -c "sudo rm -rf /"` would tokenize to
+ * head='bash' and slip through as 'normal'. The classifier must reach the
+ * inner shell string.
+ */
+function wrapperShellInner(head, argv) {
+  if (head === 'bash' || head === 'sh') {
+    for (let i = 1; i < argv.length; i++) {
+      if (argv[i] === '-c' && i + 1 < argv.length) {
+        return argv[i + 1]
+      }
+    }
+    return null
+  }
+  if (head === 'eval') {
+    // eval concatenates its args with spaces and re-parses as a command.
+    if (argv.length <= 1) return null
+    return argv.slice(1).join(' ')
+  }
+  return null
+}
+
+/**
+ * Identify an exec-style wrapper that takes a *command + args* argv (NOT a
+ * shell string). Returns the inner argv to classify, or null.
+ *
+ * Recognises:
+ *   npx <cmd> <args...>
+ *   npm exec <cmd> <args...>      (with optional `--` separator)
+ *   pnpm exec <cmd> <args...>
+ *   yarn exec <cmd> <args...>
+ *
+ * Stripping these early closes the `npx rm -rf /` bypass while leaving
+ * `npx eslint .` untouched (that recurses into eslint, which classifies as
+ * normal).
+ */
+function wrapperExecInnerArgv(head, argv) {
+  if (head === 'npx') {
+    let i = 1
+    while (i < argv.length && argv[i] === '--') i++
+    while (i < argv.length && argv[i].startsWith('-')) i++
+    if (i >= argv.length) return null
+    return argv.slice(i)
+  }
+  if (head === 'npm' || head === 'pnpm' || head === 'yarn') {
+    if (argv[1] !== 'exec') return null
+    let i = 2
+    while (i < argv.length && argv[i] === '--') i++
+    while (i < argv.length && argv[i].startsWith('-')) i++
+    if (i >= argv.length) return null
+    return argv.slice(i)
+  }
+  return null
+}
+
+/** Reduce two tier verdicts to the strongest. */
+function highestTier(a, b) {
+  const order = { hard_deny: 2, destructive: 1, normal: 0 }
+  return (order[a.tier] || 0) >= (order[b.tier] || 0) ? a : b
+}
+
 /**
  * Classify a single bash segment (one argv).
  *
  * @param {string[]} rawArgv
+ * @param {number} [depth] recursion guard for wrapper unwinding
  * @returns {{ tier: 'normal' | 'destructive' | 'hard_deny', reason?: string }}
  */
-export function classifyBashSegment(rawArgv) {
+export function classifyBashSegment(rawArgv, depth = 0) {
   if (!Array.isArray(rawArgv) || rawArgv.length === 0) return { tier: 'normal' }
+  if (depth > 8) return { tier: 'normal' } // cycle guard for nested wrappers
   const { argv, env } = stripWrappersAndEnv(rawArgv)
   if (argv.length === 0) {
     // env-only / wrapper-only segment with no command — treat as normal.
@@ -383,6 +465,30 @@ export function classifyBashSegment(rawArgv) {
   // has already been handled, but `command FOO=bar cmd` would not be valid
   // shell — so a single peel suffices in practice).
   const head = path.basename(argv[0])
+
+  // Phase 5 Codex pass: wrapper commands that take a quoted shell string
+  // (`bash -c`, `sh -c`, `eval`) must be recursively classified — otherwise
+  // `bash -c "sudo rm -rf /"` slips through as head=='bash'.
+  const inner = wrapperShellInner(head, argv)
+  if (inner !== null) {
+    const innerVerdict = classifyBashCommand(inner, depth + 1)
+    if (containsSecretEnv(env)) {
+      return highestTier(innerVerdict, { tier: 'hard_deny', reason: 'hard_deny:secret' })
+    }
+    return innerVerdict
+  }
+
+  // Phase 5 Codex pass: exec-style wrappers (`npx <cmd>`, `npm exec <cmd>`)
+  // pass the rest of argv to the inner command — strip them and recurse on
+  // the inner argv so `npx rm -rf /` classifies as `rm -rf /` would.
+  const innerArgv = wrapperExecInnerArgv(head, argv)
+  if (innerArgv !== null) {
+    const innerVerdict = classifyBashSegment(innerArgv, depth + 1)
+    if (containsSecretEnv(env)) {
+      return highestTier(innerVerdict, { tier: 'hard_deny', reason: 'hard_deny:secret' })
+    }
+    return innerVerdict
+  }
 
   // Hard-deny first — these short-circuit regardless of any destructive marks.
   if (head === 'sudo') return { tier: 'hard_deny', reason: 'hard_deny:sudo' }
@@ -415,16 +521,37 @@ export function classifyBashSegment(rawArgv) {
  * Classify a full bash command string. Tokenizes, segment-classifies, then
  * reduces by "OR of tiers" (hard_deny > destructive > normal).
  *
+ * Phase 5 Codex pass: subshell `(...)` segments are recognised — if a
+ * segment starts with `(`, the inner argv is recursively classified.
+ *
  * @param {string} cmd
+ * @param {number} [depth] recursion guard
  * @returns {{ tier: 'normal' | 'destructive' | 'hard_deny', reason?: string }}
  */
-export function classifyBashCommand(cmd) {
+export function classifyBashCommand(cmd, depth = 0) {
+  if (depth > 8) return { tier: 'normal' } // cycle guard
   const segments = tokenizeBash(cmd)
   if (segments.length === 0) return { tier: 'normal' }
   /** @type {{ tier: 'normal' | 'destructive' | 'hard_deny', reason?: string }} */
   let aggregate = { tier: 'normal' }
   for (const seg of segments) {
-    const r = classifyBashSegment(seg)
+    let segArgv = seg
+    // Subshell: tokens like ['(', 'sudo', 'cmd', ')'] mean the inner argv
+    // should be classified independently.
+    if (segArgv.length > 0 && segArgv[0] === '(') {
+      const inner = segArgv.slice(1)
+      if (inner.length > 0 && inner[inner.length - 1] === ')') inner.pop()
+      const r = classifyBashCommand(inner.join(' '), depth + 1)
+      if (r.tier === 'hard_deny') return r
+      if (r.tier === 'destructive' && aggregate.tier !== 'destructive') aggregate = r
+      continue
+    }
+    // Defensive: a stray closing `)` at the tail of an otherwise-normal
+    // segment shouldn't confuse classifiers — drop it.
+    if (segArgv.length > 0 && segArgv[segArgv.length - 1] === ')') {
+      segArgv = segArgv.slice(0, -1)
+    }
+    const r = classifyBashSegment(segArgv, depth)
     if (r.tier === 'hard_deny') return r
     if (r.tier === 'destructive' && aggregate.tier !== 'destructive') aggregate = r
   }
