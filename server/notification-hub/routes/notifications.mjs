@@ -1,7 +1,12 @@
 // /api/notifications, /api/notifications/:id, /api/notifications/:id/reply
 import { readRequestBody, safeJsonParse } from '../notification-utils.mjs'
 import { isBodyTooLargeError, sendJson, sendRequestBodyTooLarge } from '../core/http.mjs'
-import { getNotification, listNotifications } from '../services/notification-service.mjs'
+import {
+  getNotification,
+  getReplyStatus,
+  listNotifications,
+} from '../services/notification-service.mjs'
+import { listNotificationsForSession } from '../state/store.mjs'
 
 function matchNotificationDetail(pathname) {
   const m = pathname.match(/^\/api\/notifications\/([^/]+)$/)
@@ -19,6 +24,29 @@ export async function handle(req, res, ctx) {
   if (method === 'GET' && pathname === '/api/notifications') {
     const limitRaw = Number(url.searchParams.get('limit') || '20')
     const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(Math.floor(limitRaw), 1), 100) : 20
+    // Phase 4: optional ?session_id=<id> filter. When omitted, behaviour is
+    // unchanged for backwards compatibility. When set, route through
+    // listNotificationsForSession() so the response shape matches
+    // listNotifications() (replyStatus included) but only the requested
+    // session's items are surfaced.
+    const sessionIdRaw = url.searchParams.get('session_id')
+    const sessionId = typeof sessionIdRaw === 'string' && sessionIdRaw.trim() ? sessionIdRaw.trim() : null
+    if (sessionId) {
+      const filtered = listNotificationsForSession(sessionId)
+        .slice(0, limit)
+        .map((item) => ({
+          id: item.id,
+          source: item.source,
+          title: item.title,
+          summary: item.summary,
+          createdAt: item.createdAt,
+          replyCapable: item.replyCapable,
+          metadata: item.metadata,
+          replyStatus: getReplyStatus(item),
+        }))
+      sendJson(res, 200, { ok: true, items: filtered })
+      return true
+    }
     sendJson(res, 200, { ok: true, items: listNotifications(limit) })
     return true
   }

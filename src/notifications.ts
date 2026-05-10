@@ -103,9 +103,29 @@ export function createNotificationClient(baseUrl: string) {
   }
 
   return {
-    async list(limit = 20): Promise<NotificationItem[]> {
+    /**
+     * List recent notifications. Phase 4: accepts an optional
+     * `{ sessionId, limit }` object. Pre-Phase-4 callers passing a bare
+     * `number` for limit keep working — we detect and translate.
+     *
+     * - When `sessionId` is omitted → returns all notifications (existing
+     *   behaviour, unchanged for backwards compatibility).
+     * - When `sessionId` is set → server filters via
+     *   listNotificationsForSession() so the response only contains items
+     *   bound to that AgentSession.
+     */
+    async list(opts?: number | { sessionId?: string; limit?: number }): Promise<NotificationItem[]> {
+      const limit = typeof opts === 'number'
+        ? opts
+        : typeof opts?.limit === 'number'
+          ? opts.limit
+          : 20
+      const sessionId = typeof opts === 'object' && opts ? opts.sessionId : undefined
+      const params = new URLSearchParams()
+      params.set('limit', String(limit))
+      if (sessionId) params.set('session_id', sessionId)
       const res = await fetchJson<NotificationListResponse>(
-        `/api/notifications?limit=${limit}`,
+        `/api/notifications?${params.toString()}`,
         { headers: createHubHeaders() },
       )
       return res.items
@@ -190,6 +210,30 @@ export function createNotificationClient(baseUrl: string) {
         },
       )
       return res.session
+    },
+
+    /**
+     * Phase 4: GET /api/v1/sessions/active-summary
+     *
+     * Returns the Hub's current active_session_id (or null) and a map of
+     * pending-approval counts keyed by AgentSession id, excluding the active
+     * session. The polling controller hits this each tick so SessionList can
+     * render `(active)` + `(N pending)` badges without computing counts
+     * client-side from the full notifications list.
+     */
+    async fetchActiveSummary(): Promise<{
+      activeSessionId: string | null
+      pendingCountsByOtherSession: Record<string, number>
+    }> {
+      const res = await fetchJson<{
+        ok: boolean
+        active_session_id: string | null
+        pending_counts_by_other_session: Record<string, number>
+      }>('/api/v1/sessions/active-summary', { headers: createHubHeaders() })
+      return {
+        activeSessionId: res.active_session_id || null,
+        pendingCountsByOtherSession: res.pending_counts_by_other_session || {},
+      }
     },
   }
 }

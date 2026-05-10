@@ -21,6 +21,7 @@ import type { ScreenContext } from './types'
 import type { NormalizedG2Event } from '../even-events'
 import { G2_EVENT, isDoubleTapEventType } from '../even-events'
 import { CREATE_CONFIRM_AUTO_CANCEL_MS } from './_constants'
+import { setActiveSessionId, setPendingCountsByOtherSession } from '../state/store'
 
 export async function handle(event: NormalizedG2Event, ctx: ScreenContext): Promise<void> {
   const { store, conn, glassesUI, notifClient, log } = ctx
@@ -46,7 +47,10 @@ export async function handle(event: NormalizedG2Event, ctx: ScreenContext): Prom
       }
       store.sessionList.selectedIndex = Math.min(len - 1, store.sessionList.selectedIndex + 1)
     }
-    await glassesUI.showSessionList(conn, store.sessionList.sessions, store.sessionList.selectedIndex)
+    await glassesUI.showSessionList(conn, store.sessionList.sessions, store.sessionList.selectedIndex, {
+      activeSessionId: store.sessionUi.activeSessionId,
+      pendingCounts: store.sessionUi.pendingCountsByOtherSession,
+    })
     ctx.updateNotifInfo()
     return
   }
@@ -63,12 +67,38 @@ export async function handle(event: NormalizedG2Event, ctx: ScreenContext): Prom
     const target = store.sessionList.sessions[idx - 1]
     if (!target) return
     log(`SessionList: activate session id=${target.session_id} label=${target.label}`)
+    let activated = false
     try {
       await notifClient.activateSession(target.session_id)
+      activated = true
+      // Phase 4: optimistically reflect the new active id so the pending-count
+      // polling cycle doesn't render the previous active session for one tick.
+      setActiveSessionId(target.session_id)
+      // Re-poll the active-summary so badges drop the now-active row's pending
+      // count and pick up any approvals that arrived during the activate
+      // round trip. Best-effort; failures stay in the audit log only.
+      try {
+        const summary = await notifClient.fetchActiveSummary()
+        setActiveSessionId(summary.activeSessionId)
+        setPendingCountsByOtherSession(summary.pendingCountsByOtherSession)
+      } catch (err) {
+        log(`SessionList: active-summary refresh失敗: ${err instanceof Error ? err.message : String(err)}`)
+      }
+      // Re-poll notifications scoped to the freshly-active session so the
+      // user lands on the most relevant view when they exit SessionList.
+      try {
+        store.notif.items = await notifClient.list({ sessionId: target.session_id, limit: 20 })
+      } catch (err) {
+        log(`SessionList: per-session notifications refresh失敗: ${err instanceof Error ? err.message : String(err)}`)
+      }
     } catch (err) {
       log(`SessionList: activate失敗: ${err instanceof Error ? err.message : String(err)}`)
     }
-    await ctx.enterIdleScreen('SessionList: activated session')
+    // Codex 4 #6/#8: distinguish success vs failure exit reason so upstream
+    // tracing isn't misled by a hard-coded "activated session" string.
+    await ctx.enterIdleScreen(
+      activated ? 'SessionList: activated session' : 'SessionList: activate failed',
+    )
     return
   }
 
@@ -106,8 +136,10 @@ async function openCreateConfirm(ctx: ScreenContext): Promise<void> {
   store.sessionList.createConfirmTimer = setTimeout(() => {
     store.sessionList.createConfirmTimer = null
     if (store.notif.screen !== 'session-list-create-confirm') return
-    void ctx.glassesUI.showSessionList(ctx.conn, store.sessionList.sessions, store.sessionList.selectedIndex)
-      .catch(() => { /* swallow */ })
+    void ctx.glassesUI.showSessionList(ctx.conn, store.sessionList.sessions, store.sessionList.selectedIndex, {
+      activeSessionId: store.sessionUi.activeSessionId,
+      pendingCounts: store.sessionUi.pendingCountsByOtherSession,
+    }).catch(() => { /* swallow */ })
     store.sessionList.screen = 'session-list'
     store.notif.screen = 'session-list'
     ctx.updateNotifInfo()

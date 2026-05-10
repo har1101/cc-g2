@@ -81,7 +81,10 @@ async function returnToList(ctx: ScreenContext, reason: string): Promise<void> {
   clearSessionListCreateConfirmTimer()
   store.sessionList.screen = 'session-list'
   store.notif.screen = 'session-list'
-  await glassesUI.showSessionList(conn, store.sessionList.sessions, store.sessionList.selectedIndex)
+  await glassesUI.showSessionList(conn, store.sessionList.sessions, store.sessionList.selectedIndex, {
+    activeSessionId: store.sessionUi.activeSessionId,
+    pendingCounts: store.sessionUi.pendingCountsByOtherSession,
+  })
   ctx.updateNotifInfo()
   log(`SessionList create-confirm: back to list (${reason})`)
 }

@@ -244,6 +244,7 @@ HTTP_CODE="$(
   curl -s -o /dev/null -w '%{http_code}' -X POST "${HUB_URL}/api/notify/moshi" \
     -H "Content-Type: application/json" \
     ${HUB_AUTH_TOKEN:+-H "X-CC-G2-Token: ${HUB_AUTH_TOKEN}"} \
+    ${CC_G2_AGENT_SESSION_ID:+-H "X-Agent-Session-Id: ${CC_G2_AGENT_SESSION_ID}"} \
     -d "$PAYLOAD" \
     --connect-timeout 3 \
     --max-time 5 || true

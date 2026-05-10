@@ -992,6 +992,11 @@ if [ "$USE_NATIVE_CODEX" -eq 1 ]; then
     HUB_AUTH_TOKEN="$HUB_AUTH_TOKEN"
     CC_G2_TMUX_TARGET="${CC_G2_TMUX_TARGET:-}"
   )
+  # Phase 4: propagate AgentSession id so codex-hook-bridge.sh +
+  # codex-stop-notify.sh can attach the X-Agent-Session-Id header.
+  if [ -n "${CC_G2_AGENT_SESSION_ID:-}" ]; then
+    CODEX_ENV+=(CC_G2_AGENT_SESSION_ID="$CC_G2_AGENT_SESSION_ID")
+  fi
   CODEX_ARGS=(
     --enable codex_hooks
     -c "hooks=${CODEX_HOOKS_CONFIG}"
@@ -1018,8 +1023,8 @@ SETTINGS_JSON=$(jq -nc \
           type: "http",
           url: ($hub_url + "/api/hooks/permission-request"),
           timeout: 310,
-          headers: {"X-Tmux-Target": "$CC_G2_TMUX_TARGET", "X-CC-G2-Token": $hub_token},
-          allowedEnvVars: ["CC_G2_TMUX_TARGET"]
+          headers: {"X-Tmux-Target": "$CC_G2_TMUX_TARGET", "X-CC-G2-Token": $hub_token, "X-Agent-Session-Id": "$CC_G2_AGENT_SESSION_ID"},
+          allowedEnvVars: ["CC_G2_TMUX_TARGET", "CC_G2_AGENT_SESSION_ID"]
         }]
       }],
       Stop: [{
@@ -1048,7 +1053,19 @@ else
   fi
 fi
 
-if [ "${#CLAUDE_ARGS[@]}" -gt 0 ]; then
-  exec env MOSHI_NOTIFY=1 HUB_PORT="$HUB_PORT" HUB_AUTH_TOKEN="$HUB_AUTH_TOKEN" CC_G2_ORIG_STATUSLINE_CMD="$ORIG_STATUSLINE_CMD" "$CLAUDE_BIN" --settings "$SETTINGS_JSON" "${CLAUDE_ARGS[@]}"
+CLAUDE_ENV=(
+  MOSHI_NOTIFY=1
+  HUB_PORT="$HUB_PORT"
+  HUB_AUTH_TOKEN="$HUB_AUTH_TOKEN"
+  CC_G2_ORIG_STATUSLINE_CMD="$ORIG_STATUSLINE_CMD"
+)
+# Phase 4: propagate the AgentSession id from the tmux env into the Claude
+# Code child process so the PermissionRequest hook's allowedEnvVars resolves
+# the X-Agent-Session-Id header.
+if [ -n "${CC_G2_AGENT_SESSION_ID:-}" ]; then
+  CLAUDE_ENV+=(CC_G2_AGENT_SESSION_ID="$CC_G2_AGENT_SESSION_ID")
 fi
-exec env MOSHI_NOTIFY=1 HUB_PORT="$HUB_PORT" HUB_AUTH_TOKEN="$HUB_AUTH_TOKEN" CC_G2_ORIG_STATUSLINE_CMD="$ORIG_STATUSLINE_CMD" "$CLAUDE_BIN" --settings "$SETTINGS_JSON"
+if [ "${#CLAUDE_ARGS[@]}" -gt 0 ]; then
+  exec env "${CLAUDE_ENV[@]}" "$CLAUDE_BIN" --settings "$SETTINGS_JSON" "${CLAUDE_ARGS[@]}"
+fi
+exec env "${CLAUDE_ENV[@]}" "$CLAUDE_BIN" --settings "$SETTINGS_JSON"

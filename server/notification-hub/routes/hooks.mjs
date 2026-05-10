@@ -10,6 +10,7 @@ import {
 import { isBodyTooLargeError, sendJson, sendRequestBodyTooLarge } from '../core/http.mjs'
 import { log } from '../core/log.mjs'
 import { normalizePermissionRequestPayload } from '../services/approval-service.mjs'
+import { resolveSessionId } from '../services/session-router.mjs'
 
 async function handlePermissionRequestHook(req, res, deps) {
   let body
@@ -28,9 +29,16 @@ async function handlePermissionRequestHook(req, res, deps) {
     return
   }
 
+  // Phase 4: session-router resolves the agent_session_id from the
+  // X-Agent-Session-Id header (with X-Tmux-Target reverse-lookup fallback).
+  // The result threads through approval metadata so per-session views and
+  // tmux-relay reply routing stay consistent.
+  const agentSessionId = resolveSessionId(req)
+
   const shaped = normalizePermissionRequestPayload(parsed.value, {
     tmuxTarget: getString(req.headers['x-tmux-target']),
     agentSource: getString(req.headers['x-agent-source']),
+    agentSessionId,
   })
 
   const { approval } = await deps.createApproval(shaped)
@@ -106,6 +114,16 @@ export async function handle(req, res, ctx) {
     } else {
       const parsed = safeJsonParse(rawBody)
       payload = parsed.ok ? parsed.value : { rawBody }
+    }
+
+    // Phase 4: stamp the resolved agent_session_id onto incoming notifications
+    // so stop-hook / generic moshi events participate in per-session views.
+    // The header takes priority; if absent we fall back to the value already
+    // present in the payload metadata (e.g. tests or legacy callers).
+    const agentSessionId = resolveSessionId(req)
+    if (payload && typeof payload === 'object' && agentSessionId) {
+      const meta = payload.metadata && typeof payload.metadata === 'object' ? payload.metadata : {}
+      payload.metadata = { ...meta, agentSessionId: meta.agentSessionId || agentSessionId }
     }
 
     // MOSHI の permission-request 通知は HTTP hook が既に notification + approval を

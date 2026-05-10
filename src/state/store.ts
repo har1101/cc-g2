@@ -131,6 +131,22 @@ export type SessionListState = {
   createConfirmTimer: ReturnType<typeof setTimeout> | null
 }
 
+/**
+ * Phase 4: cross-screen multi-session UI state.
+ *
+ * `activeSessionId` mirrors the Hub's getActiveSessionId() — set when the
+ * user activates a session row from SessionList (or via active-summary
+ * polling). SessionList renders an `(active)` label next to this id.
+ *
+ * `pendingCountsByOtherSession` is populated from
+ * /api/v1/sessions/active-summary on each polling tick and rendered as
+ * `(N pending)` badges on non-active rows.
+ */
+export type SessionUiState = {
+  activeSessionId: string | null
+  pendingCountsByOtherSession: Record<string, number>
+}
+
 export type Store = {
   notif: NotificationUIState
   reply: ReplyState
@@ -141,6 +157,7 @@ export type Store = {
   eventQueue: EventQueueState
   context: ContextState
   sessionList: SessionListState
+  sessionUi: SessionUiState
 }
 
 /** 既定値で store を生成。 main.ts は import 時にこのインスタンスをそのまま使う。 */
@@ -239,7 +256,12 @@ function createStore(): Store {
     createConfirmTimer: null,
   }
 
-  return { notif, reply, voice, dev, dashboard, idle, eventQueue, context, sessionList }
+  const sessionUi: SessionUiState = {
+    activeSessionId: null,
+    pendingCountsByOtherSession: {},
+  }
+
+  return { notif, reply, voice, dev, dashboard, idle, eventQueue, context, sessionList, sessionUi }
 }
 
 export const store: Store = createStore()
@@ -323,4 +345,22 @@ export function clearSessionListCreateConfirmTimer(): void {
     clearTimeout(store.sessionList.createConfirmTimer)
     store.sessionList.createConfirmTimer = null
   }
+}
+
+/**
+ * Phase 4: cache the active session id locally so SessionList can render the
+ * `(active)` marker without re-querying. Mirrors the Hub's getActiveSessionId
+ * value — the source of truth still lives server-side.
+ */
+export function setActiveSessionId(id: string | null): void {
+  store.sessionUi.activeSessionId = id
+}
+
+/**
+ * Phase 4: replace the per-session pending-count map. Polling controller
+ * calls this from each /api/v1/sessions/active-summary tick so SessionList
+ * badges reflect the latest server view.
+ */
+export function setPendingCountsByOtherSession(map: Record<string, number>): void {
+  store.sessionUi.pendingCountsByOtherSession = map
 }

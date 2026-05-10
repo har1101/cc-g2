@@ -157,7 +157,8 @@ export async function persistReply(record, cfg) {
  * @param {{
  *   matchPendingApprovalForReply: (params: { replyText: string, notification: import('../state/store.mjs').NotificationItem }) => import('../state/store.mjs').ApprovalRecord | null,
  *   resolveApproval: (id: string, decision: 'approve'|'deny', comment: string|undefined, decidedBy: string|undefined) => unknown,
- *   relayReplyIfConfigured: (params: { reply: import('../state/store.mjs').ReplyRecord, notification: any }) => Promise<{ status: string, error?: string }>,
+ *   relayReplyIfConfigured: (params: { reply: import('../state/store.mjs').ReplyRecord, notification: any }, opts?: { tmuxTarget?: string, bypassSourceFilter?: boolean }) => Promise<{ status: string, error?: string }>,
+ *   resolveTmuxTarget?: (sessionId: string) => string | null,
  *   repliesFile: string,
  * }} cfg
  *
@@ -344,16 +345,34 @@ export async function processReply(input, cfg) {
       metadata: item.metadata,
     },
   })
+  // Phase 4: when the inbound notification is bound to a known AgentSession,
+  // resolve its tmux pane target via session-router and pass to the relay so
+  // reply-relay.sh sends to the exact pane (RELAY_TMUX_TARGET env). When no
+  // session is registered, fall back to the legacy
+  // metadata.tmuxTarget auto-detect inside reply-relay.sh.
+  let relayTmuxTarget = ''
+  const replyAgentSessionId =
+    item.metadata && typeof item.metadata.agentSessionId === 'string'
+      ? item.metadata.agentSessionId
+      : ''
+  if (replyAgentSessionId && cfg.resolveTmuxTarget) {
+    const resolved = cfg.resolveTmuxTarget(replyAgentSessionId)
+    if (resolved) relayTmuxTarget = resolved
+  }
+
   const relay = shouldRelay
-    ? await cfg.relayReplyIfConfigured({
-        reply: record,
-        notification: {
-          id: item.id,
-          title: item.title,
-          summary: item.summary,
-          metadata: item.metadata,
+    ? await cfg.relayReplyIfConfigured(
+        {
+          reply: record,
+          notification: {
+            id: item.id,
+            title: item.title,
+            summary: item.summary,
+            metadata: item.metadata,
+          },
         },
-      })
+        relayTmuxTarget ? { tmuxTarget: relayTmuxTarget } : undefined,
+      )
     : { status: 'stubbed' }
   const statuses = [fwd.status, relay.status]
   if (statuses.includes('failed')) record.status = 'failed'

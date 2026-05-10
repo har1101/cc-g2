@@ -1217,17 +1217,24 @@ export function createGlassesUI() {
      *   line 1+: ●/○ <label> <status>
      *
      * `selectedIndex` 0 == sentinel; 1..N == sessions[selectedIndex - 1].
+     *
+     * Phase 4: `opts.activeSessionId` decorates the matching row with an
+     * `(active)` label after the working/idle marker; `opts.pendingCounts`
+     * appends `(N pending)` to non-active rows whose session id is keyed in
+     * the map. Both are optional — pre-Phase-4 callers see the legacy layout.
      */
     async showSessionList(
       conn: BridgeConnection,
       sessions: AgentSessionLike[],
       selectedIndex: number,
-      _opts?: { activeSessionId?: string | null },
+      opts?: { activeSessionId?: string | null; pendingCounts?: Record<string, number> },
     ): Promise<void> {
       if (!conn.bridge) {
         log(`[Mock] G2 SessionList: ${sessions.length} sessions selected=${selectedIndex}`)
         return
       }
+      const activeSessionId = opts?.activeSessionId || null
+      const pendingCounts = opts?.pendingCounts || {}
       const sentinel = '↓ Pull to create new'
       const itemNames: string[] = [sentinel]
       for (const s of sessions) {
@@ -1243,7 +1250,15 @@ export function createGlassesUI() {
               : s.status === 'done'
                 ? ' done'
                 : ' idle'
-        const raw = `${mark} ${label}${statusBadge}`
+        const isActive = activeSessionId !== null && s.session_id === activeSessionId
+        const activeLabel = isActive ? ' (active)' : ''
+        // Pending badge: only on non-active rows. The Hub's
+        // pendingApprovalCountByOtherSessions() already excludes the active
+        // session, but we double-guard here so direct callers (tests) can
+        // pass a complete map without surprising results.
+        const pending = !isActive ? (pendingCounts[s.session_id] || 0) : 0
+        const pendingBadge = pending > 0 ? ` (${pending} pending)` : ''
+        const raw = `${mark} ${label}${statusBadge}${activeLabel}${pendingBadge}`
         itemNames.push(truncateByBytes(raw, 45))
       }
 

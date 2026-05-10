@@ -46,6 +46,7 @@ import * as uiRoute from './routes/ui.mjs'
 import { attachSttStreamWss } from './routes/stt-stream.mjs'
 import { createDeepgramEngine } from './stt/deepgram-engine.mjs'
 import { createSessionService, loadProjectAllowlist } from './services/session-service.mjs'
+import { resolveTmuxTarget as resolveTmuxTargetForSession } from './services/session-router.mjs'
 
 const { notificationsFile, repliesFile, clientEventsFile, approvalsFile, sessionsFile } = buildPaths({
   dataDir: config.dataDir,
@@ -108,6 +109,10 @@ const processReply = (input) =>
     matchPendingApprovalForReply: approvalServiceMatchForReply,
     resolveApproval,
     relayReplyIfConfigured,
+    // Phase 4: per-session tmux pane resolver. Returns null when the session
+    // is not in the registry; processReply then falls back to the legacy
+    // metadata.tmuxTarget auto-detect inside reply-relay.sh.
+    resolveTmuxTarget: resolveTmuxTargetForSession,
     repliesFile,
   })
 

@@ -18,7 +18,13 @@ import type { NotificationUIState } from './glasses-ui'
 import type { GlassesUI } from './screens/types'
 import type { createNotificationClient, NotificationItem } from './notifications'
 import { appConfig, createHubHeaders } from './config'
-import { store, type ContextSession, cancelIdleSingleTapTimer } from './state/store'
+import {
+  store,
+  type ContextSession,
+  cancelIdleSingleTapTimer,
+  setActiveSessionId,
+  setPendingCountsByOtherSession,
+} from './state/store'
 
 export type NotificationControllerDeps = {
   getConnection: () => BridgeConnection | null
@@ -172,6 +178,18 @@ export function createNotificationController(deps: NotificationControllerDeps): 
     } catch { /* ignore */ }
   }
 
+  // Phase 4: refresh active session id + pending-count map. Called once per
+  // notification polling tick so SessionList badges stay roughly in sync with
+  // the Hub. Failures are silent — the UI keeps the last known map until the
+  // next successful poll.
+  async function fetchActiveSummary() {
+    try {
+      const summary = await notifClient.fetchActiveSummary()
+      setActiveSessionId(summary.activeSessionId)
+      setPendingCountsByOtherSession(summary.pendingCountsByOtherSession)
+    } catch { /* ignore */ }
+  }
+
   async function flushPendingNotificationUi(reason: string) {
     const conn = getConnection()
     if (!conn || isAnyRendering()) return
@@ -202,6 +220,10 @@ export function createNotificationController(deps: NotificationControllerDeps): 
       const conn = getConnection()
       if (!conn) return
       fetchContextStatus()
+      // Phase 4: piggyback the active-summary fetch onto the existing polling
+      // cadence so we don't introduce a new timer. Fire-and-forget — the
+      // notifications branch below still runs even if the summary failed.
+      void fetchActiveSummary()
       await flushPendingNotificationUi('polling')
       // 描画中はスキップ（SDK呼び出し衝突防止）
       if (isAnyRendering()) return

@@ -261,10 +261,23 @@ export async function enterSessionListScreen(reason: string): Promise<void> {
   } catch (err) {
     d.log(`SessionList: 初期取得失敗 ${err instanceof Error ? err.message : String(err)}`)
   }
+  // Phase 4: prefetch the active-summary so the first paint already shows
+  // (active) + (N pending) badges. This is best-effort — on failure we keep
+  // whatever the polling controller last cached in store.sessionUi.
+  try {
+    const summary = await d.notifClient.fetchActiveSummary()
+    store.sessionUi.activeSessionId = summary.activeSessionId
+    store.sessionUi.pendingCountsByOtherSession = summary.pendingCountsByOtherSession
+  } catch (err) {
+    d.log(`SessionList: active-summary取得失敗 ${err instanceof Error ? err.message : String(err)}`)
+  }
   store.sessionList.selectedIndex = 0
   store.sessionList.screen = 'session-list'
   store.notif.screen = 'session-list'
-  await d.glassesUI.showSessionList(conn, store.sessionList.sessions, 0)
+  await d.glassesUI.showSessionList(conn, store.sessionList.sessions, 0, {
+    activeSessionId: store.sessionUi.activeSessionId,
+    pendingCounts: store.sessionUi.pendingCountsByOtherSession,
+  })
   d.updateNotifInfo()
   d.log(`SessionList enter (${reason})`)
 }
