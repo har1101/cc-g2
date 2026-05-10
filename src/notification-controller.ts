@@ -73,6 +73,8 @@ function screenLabel(screen: NotificationUIState['screen']): string {
     case 'voice-command-done': return 'vc-done'
     case 'session-list': return 'sessions'
     case 'session-list-create-confirm': return 'sess-new'
+    case 'permission-destructive-confirm': return 'destruct'
+    case 'action-blocked': return 'blocked'
   }
 }
 

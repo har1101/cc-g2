@@ -71,6 +71,9 @@ export type NotificationUIState = {
     // Phase 3: SessionList (pull-to-new-session) screens
     | 'session-list'
     | 'session-list-create-confirm'
+    // Phase 5: destructive 2-step confirm + hard-deny acknowledgement screens
+    | 'permission-destructive-confirm'
+    | 'action-blocked'
   items: NotificationItem[]
   selectedIndex: number
   /** detail画面のページ送り用（fullTextを複数ページに分割） */
@@ -85,6 +88,23 @@ export type NotificationUIState = {
   askQuestionIndex: number
   /** AskUserQuestion: 回答の蓄積 { "質問テキスト": "選択ラベル" } */
   askAnswers: Record<string, string>
+  /**
+   * Phase 5: destructive permission 2-step confirm state. Tracks how many
+   * swipe-ups the user has issued during the confirm screen and the
+   * notification id that owns the confirmation. Reset on cancel / approve.
+   */
+  permissionConfirm: {
+    stepCount: number
+    risk_tier: 'destructive' | null
+    targetItemId: string | null
+    /** 30s auto-cancel timer for the confirm screen */
+    timer: ReturnType<typeof setTimeout> | null
+  }
+  /** Phase 5: hard-deny notifications carry an auto-ack timer (60s default). */
+  blocked: {
+    targetItemId: string | null
+    timer: ReturnType<typeof setTimeout> | null
+  }
 }
 
 /**
@@ -289,7 +309,7 @@ function formatCurrentDateTime(now = new Date()): string {
 export function createGlassesUI() {
   // The host treats startup-page creation as one-time init; later UI changes should use rebuild.
   const startupRenderedBridges = new WeakSet<object>()
-  const layoutByBridge = new WeakMap<object, 'base' | 'text' | 'idle-launcher' | 'approval' | 'notif-list' | 'notif-detail' | 'notif-actions' | 'ask-question' | 'reply-recording' | 'reply-confirm' | 'reply-result' | 'vc-recording' | 'vc-rec-stream' | 'vc-confirm' | 'vc-sending' | 'vc-done' | 'session-list' | 'session-list-create-confirm'>()
+  const layoutByBridge = new WeakMap<object, 'base' | 'text' | 'idle-launcher' | 'approval' | 'notif-list' | 'notif-detail' | 'notif-actions' | 'ask-question' | 'reply-recording' | 'reply-confirm' | 'reply-result' | 'vc-recording' | 'vc-rec-stream' | 'vc-confirm' | 'vc-sending' | 'vc-done' | 'session-list' | 'session-list-create-confirm' | 'perm-destruct-confirm' | 'action-blocked'>()
   const bridgeKeyOf = (conn: BridgeConnection) => conn.bridge as unknown as object
 
   // 描画ロック: SDK呼び出しの同時実行を防ぐ（実機で衝突するとG2が固まる）
@@ -658,8 +678,15 @@ export function createGlassesUI() {
     },
 
     /**
-     * 通知詳細からのアクション選択（SDK標準ListContainer）
-     * ※実機ではスクロール方向が物理操作と逆になる
+     * Phase 5: notification-actions screen with the v3 input model.
+     *
+     * Visual layout: header (tool title + risk badge if destructive) +
+     * gesture cheat-sheet body. No selection list; gestures drive directly.
+     *
+     *   - Swipe Up   → Approve (destructive shows ⚠ + 2-step hint)
+     *   - Swipe Down → Deny
+     *   - Tap        → Voice comment
+     *   - Double Tap → 詳細に戻る
      */
     async showNotificationActions(conn: BridgeConnection, detail: NotificationDetail): Promise<void> {
       if (!conn.bridge) {
@@ -667,42 +694,151 @@ export function createGlassesUI() {
         return
       }
 
-      const actionItems = ['コメント', 'Approve', 'Deny', '◀ 戻る']
+      const riskTier = (detail.metadata as { risk_tier?: string } | undefined)?.risk_tier
+      const isDestructive = riskTier === 'destructive'
+      const titleClipped = detail.title.length > 22 ? `${detail.title.slice(0, 21)}…` : detail.title
+      const headerText = isDestructive
+        ? `⚠ Destructive: ${titleClipped}`
+        : `操作を選択: ${titleClipped}`
+
+      const hintLines = [
+        'Swipe Up    : Approve' + (isDestructive ? ' (2段階)' : ''),
+        'Swipe Down  : Deny',
+        'Tap         : コメント',
+        'Double Tap  : 詳細に戻る',
+      ].join('\n')
 
       const headerContainer = new TextContainerProperty({
         xPosition: 8,
         yPosition: 4,
         width: 560,
-        height: 52,
+        height: 28,
         containerID: 1,
         containerName: 'notif-act-hdr',
-        content: `操作を選択\n${detail.title.length > 20 ? `${detail.title.slice(0, 19)}…` : detail.title}`,
+        content: headerText,
         isEventCapture: 0,
       })
 
-      const listContainer = new ListContainerProperty({
+      const bodyContainer = new TextContainerProperty({
         xPosition: 8,
-        yPosition: 58,
+        yPosition: 36,
         width: 560,
-        height: 210,
+        height: 240,
         containerID: 2,
-        containerName: 'notif-act-lst',
-        itemContainer: new ListItemContainerProperty({
-          itemCount: actionItems.length,
-          itemWidth: 0,
-          isItemSelectBorderEn: 1,
-          itemName: actionItems,
-        }),
+        containerName: 'notif-act-body',
+        content: hintLines,
         isEventCapture: 1,
       })
 
       await renderStartupPage(conn, {
-        texts: [headerContainer],
-        lists: [listContainer],
+        texts: [headerContainer, bodyContainer],
         targetLayout: 'notif-actions',
       })
       layoutByBridge.set(bridgeKeyOf(conn), 'notif-actions')
-      log(`G2に通知アクション表示: "${detail.title}"`)
+      log(`G2に通知アクション表示: "${detail.title}" risk_tier=${riskTier ?? 'normal'}`)
+    },
+
+    /**
+     * Phase 5: destructive 2-step confirm screen.
+     *
+     * Shown after the user does swipe-up on a notification-actions screen
+     * whose linked approval is `risk_tier=destructive`. The user must
+     * swipe-up *again* on this screen to actually approve. Any other input
+     * (swipe down, tap, double tap) cancels back to detail-actions; a 30s
+     * timeout also cancels.
+     */
+    async showPermissionDestructiveConfirm(
+      conn: BridgeConnection,
+      detail: NotificationDetail,
+    ): Promise<void> {
+      if (!conn.bridge) {
+        log(`[Mock] G2 destructive confirm: "${detail.title}"`)
+        return
+      }
+
+      const summary = detail.summary && detail.summary.length > 80
+        ? `${detail.summary.slice(0, 79)}…`
+        : (detail.summary || detail.title)
+
+      const headerContainer = new TextContainerProperty({
+        xPosition: 8,
+        yPosition: 4,
+        width: 560,
+        height: 28,
+        containerID: 1,
+        containerName: 'perm-cfm-hdr',
+        content: '⚠ Destructive',
+        isEventCapture: 0,
+      })
+
+      const bodyContainer = new TextContainerProperty({
+        xPosition: 8,
+        yPosition: 36,
+        width: 560,
+        height: 240,
+        containerID: 2,
+        containerName: 'perm-cfm-body',
+        content: `${summary}\n\nもう一度 Swipe Up で承認\n他の操作でキャンセル`,
+        isEventCapture: 1,
+      })
+
+      await renderStartupPage(conn, {
+        texts: [headerContainer, bodyContainer],
+        targetLayout: 'perm-destruct-confirm',
+      })
+      layoutByBridge.set(bridgeKeyOf(conn), 'perm-destruct-confirm')
+      log(`G2 destructive confirm表示: "${detail.title}"`)
+    },
+
+    /**
+     * Phase 5: Action Blocked screen (hard-deny ack).
+     *
+     * Shown when the Hub already denied the request (e.g. `sudo`, `WebFetch`).
+     * The agent has already received a deny response — this screen is purely
+     * informational. Swipe Down acknowledges; 60s auto-acks.
+     */
+    async showActionBlocked(
+      conn: BridgeConnection,
+      detail: NotificationDetail,
+    ): Promise<void> {
+      if (!conn.bridge) {
+        log(`[Mock] G2 action blocked: "${detail.title}"`)
+        return
+      }
+
+      const reason = (detail.metadata?.reason as string | undefined) || 'blocked'
+      const summary = detail.summary && detail.summary.length > 80
+        ? `${detail.summary.slice(0, 79)}…`
+        : (detail.summary || detail.title)
+
+      const headerContainer = new TextContainerProperty({
+        xPosition: 8,
+        yPosition: 4,
+        width: 560,
+        height: 28,
+        containerID: 1,
+        containerName: 'blocked-hdr',
+        content: '🛑 Blocked',
+        isEventCapture: 0,
+      })
+
+      const bodyContainer = new TextContainerProperty({
+        xPosition: 8,
+        yPosition: 36,
+        width: 560,
+        height: 240,
+        containerID: 2,
+        containerName: 'blocked-body',
+        content: `${reason}\n${summary}\n\nSwipe Down で確認`,
+        isEventCapture: 1,
+      })
+
+      await renderStartupPage(conn, {
+        texts: [headerContainer, bodyContainer],
+        targetLayout: 'action-blocked',
+      })
+      layoutByBridge.set(bridgeKeyOf(conn), 'action-blocked')
+      log(`G2 action blocked表示: "${detail.title}" reason=${reason}`)
     },
 
     /**

@@ -192,7 +192,10 @@ printf '%s\\n' "$@" >> ${JSON.stringify(notifierArgsFile)}
       session_id: 'test-session-deny-nocomment',
       cwd: '/tmp/deny2',
       tool_name: 'Bash',
-      tool_input: { command: 'rm -rf /' },
+      // Phase 5: a `rm -rf /` would be hard-deny'd at the hook layer
+      // (no approval created). Use a normal-classified command so this test
+      // still exercises the existing approval-decide-deny path.
+      tool_input: { command: 'echo deny-test' },
     }
 
     const hookPromise = postJson(hubBase, '/api/hooks/permission-request', hookBody)
@@ -285,23 +288,25 @@ printf '%s\\n' "$@" >> ${JSON.stringify(notifierArgsFile)}
   })
 
   it('POST /api/hooks/permission-request — replies stay bound to the matching notification when tool names collide', async () => {
+    // Phase 5: WebSearch is hard-deny'd at the hook layer now, so this
+    // colliding-tool-names test uses Edit (normal tier) instead.
     const firstHookPromise = postJson(hubBase, '/api/hooks/permission-request', {
       session_id: 'websearch-session',
       cwd: '/tmp/websearch-project',
-      tool_name: 'WebSearch',
-      tool_input: { query: 'Claude Code Anthropic 2026 latest news updates' },
+      tool_name: 'Edit',
+      tool_input: { file_path: '/tmp/websearch-project/a.md', old_string: 'a', new_string: 'b' },
     })
     const secondHookPromise = postJson(hubBase, '/api/hooks/permission-request', {
       session_id: 'websearch-session',
       cwd: '/tmp/websearch-project',
-      tool_name: 'WebSearch',
-      tool_input: { query: 'Anthropic Claude Code new features 2026' },
+      tool_name: 'Edit',
+      tool_input: { file_path: '/tmp/websearch-project/b.md', old_string: 'a', new_string: 'b' },
     })
     const thirdHookPromise = postJson(hubBase, '/api/hooks/permission-request', {
       session_id: 'websearch-session',
       cwd: '/tmp/websearch-project',
-      tool_name: 'WebSearch',
-      tool_input: { query: 'Claude Code announcement 2026 release' },
+      tool_name: 'Edit',
+      tool_input: { file_path: '/tmp/websearch-project/c.md', old_string: 'a', new_string: 'b' },
     })
 
     await new Promise((r) => setTimeout(r, 700))
@@ -309,11 +314,11 @@ printf '%s\\n' "$@" >> ${JSON.stringify(notifierArgsFile)}
     const { data: notifData } = await getJson(hubBase, '/api/notifications?limit=20')
     const websearchNotifs = notifData.items
       .filter((n) => n.metadata?.cwd === '/tmp/websearch-project' && n.metadata?.sessionId === 'websearch-session')
-      .filter((n) => n.title === 'WebSearch')
+      .filter((n) => n.title === 'Edit')
     expect(websearchNotifs.length).toBeGreaterThanOrEqual(3)
 
     const { data: pendingData } = await getJson(hubBase, '/api/approvals')
-    const pending = pendingData.items.filter((a) => a.cwd === '/tmp/websearch-project' && a.toolName === 'WebSearch')
+    const pending = pendingData.items.filter((a) => a.cwd === '/tmp/websearch-project' && a.toolName === 'Edit')
     expect(pending).toHaveLength(3)
 
     for (const approval of pending) {
@@ -336,14 +341,16 @@ printf '%s\\n' "$@" >> ${JSON.stringify(notifierArgsFile)}
   })
 
   it('POST /api/hooks/permission-request — same tool across multiple tmux targets can be approved independently', async () => {
+    // Phase 5: Edit is normal tier; WebSearch (the original fixture) is now
+    // hard-deny'd. The test still validates per-tmux-target routing.
     const sessionAHookPromise = postJson(
       hubBase,
       '/api/hooks/permission-request',
       {
         session_id: 'multi-tmux-a',
         cwd: '/tmp/multi-tmux-a',
-        tool_name: 'WebSearch',
-        tool_input: { query: 'tmux target A' },
+        tool_name: 'Edit',
+        tool_input: { file_path: '/tmp/multi-tmux-a/a.md', old_string: 'a', new_string: 'b' },
       },
       { 'X-Tmux-Target': 'cc-g2-a:0.0' },
     )
@@ -353,8 +360,8 @@ printf '%s\\n' "$@" >> ${JSON.stringify(notifierArgsFile)}
       {
         session_id: 'multi-tmux-b',
         cwd: '/tmp/multi-tmux-b',
-        tool_name: 'WebSearch',
-        tool_input: { query: 'tmux target B' },
+        tool_name: 'Edit',
+        tool_input: { file_path: '/tmp/multi-tmux-b/b.md', old_string: 'a', new_string: 'b' },
       },
       { 'X-Tmux-Target': 'cc-g2-b:0.0' },
     )

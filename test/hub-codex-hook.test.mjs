@@ -216,10 +216,13 @@ describe('Codex Hook Bridge Integration', () => {
   })
 
   it('ブリッジスクリプトが deny を Codex PermissionRequest decision に変換する', async () => {
+    // Phase 5: `rm -rf /` is hard-deny'd at the hook layer now (no approval
+    // is created), so the test of an explicit G2-driven deny uses a normal
+    // command. The bridge → hub → G2-deny path is what's being exercised.
     const codexInput = JSON.stringify({
       hook_event_name: 'PermissionRequest',
       tool_name: 'Bash',
-      tool_input: { command: 'rm -rf /' },
+      tool_input: { command: 'echo dangerous-action-deny-path' },
     })
 
     const bridgePromise = new Promise((resolve, reject) => {
@@ -245,7 +248,7 @@ describe('Codex Hook Bridge Integration', () => {
 
     const pending = await waitForApproval(
       hubBase,
-      (a) => a.status === 'pending' && a.agentName === 'codex' && a.toolInput?.command === 'rm -rf /',
+      (a) => a.status === 'pending' && a.agentName === 'codex' && a.toolInput?.command === 'echo dangerous-action-deny-path',
     )
 
     await postJson(hubBase, `/api/approvals/${pending.id}/decide`, {

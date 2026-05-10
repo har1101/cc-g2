@@ -20,6 +20,7 @@ import type { NotificationDetail } from '../notifications'
 import {
   bumpVoiceGeneration,
   cancelIdleSingleTapTimer,
+  clearReplyRecordingTimers,
   clearVoiceDoneTimer,
   clearVoiceRecordingMaxTimer,
   resetReplyAudio,
@@ -32,6 +33,8 @@ import {
   VOICE_COMMAND_RECORDING_MAX_MS,
   TAP_SCROLL_SUPPRESS_MS,
   DETAIL_SCROLL_COOLDOWN_MS,
+  REPLY_RECORDING_MAX_MS,
+  REPLY_TIMEOUT_FORCE_FINALIZE_MS,
 } from './_constants'
 import { G2_EVENT, getNormalizedEventType } from '../even-events'
 import type { EvenHubEvent } from '@evenrealities/even_hub_sdk'
@@ -311,6 +314,7 @@ export async function startReplyAudioRecording(): Promise<boolean> {
 export async function stopReplyAudioRecording(): Promise<void> {
   const d = need()
   store.reply.isRecording = false
+  clearReplyRecordingTimers()
   if (currentReplyAudioHandle) {
     try {
       await currentReplyAudioHandle.release()
@@ -319,6 +323,55 @@ export async function stopReplyAudioRecording(): Promise<void> {
     }
     currentReplyAudioHandle = null
   }
+}
+
+/**
+ * Phase 5 §5.5: arm the reply-recording watchdog timers.
+ * - 30s recording max → force finalize
+ * - if the linked notification has metadata.timeout_at, schedule a force-deny
+ *   at `(timeout_at - REPLY_TIMEOUT_FORCE_FINALIZE_MS)` so the server hears
+ *   from us before the approval long-poll times out.
+ *
+ * Both callbacks run with the live screen context (re-acquired so a
+ * reconnect doesn't leave a stale handle).
+ *
+ * @param onMax       fired at 30s
+ * @param onTimeoutForce  fired when permission timeout is imminent
+ */
+export function armReplyRecordingTimers(
+  onMax: () => void,
+  onTimeoutForce: () => void,
+): void {
+  clearReplyRecordingTimers()
+  store.reply.recordingMaxTimer = setTimeout(() => {
+    store.reply.recordingMaxTimer = null
+    onMax()
+  }, REPLY_RECORDING_MAX_MS)
+
+  const detail = store.notif.detailItem
+  const timeoutAtRaw = detail?.metadata && (detail.metadata as { timeout_at?: string }).timeout_at
+  if (typeof timeoutAtRaw !== 'string') return
+  const timeoutAt = Date.parse(timeoutAtRaw)
+  if (!Number.isFinite(timeoutAt)) return
+  const fireAt = timeoutAt - REPLY_TIMEOUT_FORCE_FINALIZE_MS
+  const ms = Math.max(0, fireAt - Date.now())
+  store.reply.timeoutCoordinationTimer = setTimeout(() => {
+    store.reply.timeoutCoordinationTimer = null
+    onTimeoutForce()
+  }, ms)
+}
+
+/**
+ * Phase 5: how many ms remain until the linked notification's permission
+ * timeout. Returns Infinity if no timeout_at is on the metadata.
+ */
+export function permissionTimeoutRemainingMs(): number {
+  const detail = store.notif.detailItem
+  const timeoutAtRaw = detail?.metadata && (detail.metadata as { timeout_at?: string }).timeout_at
+  if (typeof timeoutAtRaw !== 'string') return Infinity
+  const timeoutAt = Date.parse(timeoutAtRaw)
+  if (!Number.isFinite(timeoutAt)) return Infinity
+  return Math.max(0, timeoutAt - Date.now())
 }
 
 // ---------------------------------------------------------------------------

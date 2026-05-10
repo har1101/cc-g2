@@ -9,8 +9,15 @@ import {
 } from '../notification-utils.mjs'
 import { isBodyTooLargeError, sendJson, sendRequestBodyTooLarge } from '../core/http.mjs'
 import { log } from '../core/log.mjs'
+import { writeAuditEntry } from '../core/audit-log.mjs'
 import { normalizePermissionRequestPayload } from '../services/approval-service.mjs'
+import { classify, inputPreviewFor } from '../services/policy-service.mjs'
 import { resolveSessionId } from '../services/session-router.mjs'
+
+// Phase 5 §5.5: destructive approvals carry a metadata.timeout_at so the G2
+// reply-recording substate can budget for STT vs. server-side timeout.
+// Default 60s lines up with approval long-poll responsiveness.
+const PERMISSION_TIMEOUT_DEFAULT_MS = 60_000
 
 async function handlePermissionRequestHook(req, res, deps) {
   let body
@@ -40,6 +47,83 @@ async function handlePermissionRequestHook(req, res, deps) {
     agentSource: getString(req.headers['x-agent-source']),
     agentSessionId,
   })
+
+  // Phase 5 §5.1–5.2: classify upfront. Hard-deny short-circuits — no approval
+  // is created, no long-poll, agent gets immediate deny + G2 sees a separate
+  // permission.blocked notification (metadata.hookType='permission-blocked').
+  // Destructive stamps risk_tier on the approval so the G2 UI knows to
+  // require a 2-step swipe-up confirmation.
+  const requestId = randomUUID()
+  const verdict = classify({
+    tool_name: shaped.toolName,
+    tool_input: shaped.toolInput,
+    agent_session_id: agentSessionId,
+    request_id: requestId,
+  })
+  const inputPreview = inputPreviewFor(shaped.toolName, shaped.toolInput)
+
+  if (verdict.tier === 'hard_deny') {
+    // Synthesize a permission.blocked notification (no approval lifecycle).
+    // The G2 frontend sees `metadata.hookType === 'permission-blocked'` and
+    // routes to the action-blocked screen.
+    const blockedPayload = {
+      title: shaped.toolName || 'Permission',
+      body: `🛑 Blocked: ${verdict.reason}\n\n$ ${inputPreview}`,
+      hookType: 'permission-blocked',
+      metadata: {
+        ...(shaped.metadata || {}),
+        hookType: 'permission-blocked',
+        request_id: requestId,
+        toolName: shaped.toolName,
+        cwd: shaped.cwd || undefined,
+        agentName: shaped.agentName,
+        risk_tier: 'hard_deny',
+        reason: verdict.reason,
+        input_preview: inputPreview,
+        ack_window_ms: 60_000,
+      },
+    }
+    try {
+      await deps.addNotification(blockedPayload, 'permission-blocked')
+    } catch (err) {
+      log(`permission.blocked notification persist failed: ${err instanceof Error ? err.message : String(err)}`)
+    }
+
+    writeAuditEntry({
+      event: 'permission.blocked',
+      request_id: requestId,
+      agent_session_id: agentSessionId,
+      tool_name: shaped.toolName,
+      input_preview: inputPreview,
+      reason: verdict.reason,
+    })
+
+    // Reply with the same shape as a denied approval so claude/codex bridges
+    // don't need branching logic. comment field surfaces the reason.
+    const denyMessage = `G2 blocked (${verdict.reason})`
+    sendJson(res, 200, {
+      hookSpecificOutput: {
+        hookEventName: 'PermissionRequest',
+        decision: { behavior: 'deny', message: denyMessage },
+      },
+    })
+    return
+  }
+
+  // Stamp risk_tier and timeout_at onto destructive approvals so the G2
+  // frontend can branch (2-step confirm) and the reply-recording substate
+  // can coordinate timeouts (Phase 5 §5.5). Normal approvals also receive
+  // timeout_at — it's purely informational for the client.
+  const timeoutMs = PERMISSION_TIMEOUT_DEFAULT_MS
+  const timeoutAt = new Date(Date.now() + timeoutMs).toISOString()
+  shaped.metadata = {
+    ...(shaped.metadata || {}),
+    request_id: requestId,
+    risk_tier: verdict.tier,
+    timeout_at: timeoutAt,
+    timeout_ms: timeoutMs,
+    input_preview: inputPreview,
+  }
 
   const { approval } = await deps.createApproval(shaped)
 

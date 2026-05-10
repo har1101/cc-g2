@@ -28,6 +28,14 @@ export type ReplyState = {
   audioTotalBytes: number
   isRecording: boolean
   stopInFlight: boolean
+  /**
+   * Phase 5: reply-recording 内の watchdog timer 群。
+   * - recordingMaxTimer: 30s 強制 finalize (REPLY_RECORDING_MAX_MS)
+   * - timeoutCoordinationTimer: permission timeout 残り 3s に到達したら強制 deny
+   * 両方とも reply-recording entry / cancel / finalize で reset する。
+   */
+  recordingMaxTimer: ReturnType<typeof setTimeout> | null
+  timeoutCoordinationTimer: ReturnType<typeof setTimeout> | null
 }
 
 /** voice-command (走行中セッションへの自由テキスト送信) 用 state */
@@ -173,6 +181,9 @@ function createStore(): Store {
     askQuestions: [],
     askQuestionIndex: 0,
     askAnswers: {},
+    // Phase 5
+    permissionConfirm: { stepCount: 0, risk_tier: null, targetItemId: null, timer: null },
+    blocked: { targetItemId: null, timer: null },
   }
 
   const reply: ReplyState = {
@@ -180,6 +191,8 @@ function createStore(): Store {
     audioTotalBytes: 0,
     isRecording: false,
     stopInFlight: false,
+    recordingMaxTimer: null,
+    timeoutCoordinationTimer: null,
   }
 
   const voice: VoiceState = {
@@ -307,6 +320,18 @@ export function resetReplyAudio(): void {
   store.reply.audioChunks = []
   store.reply.audioTotalBytes = 0
   store.reply.stopInFlight = false
+}
+
+/** Phase 5: reply-recording の watchdog タイマーを全部止める */
+export function clearReplyRecordingTimers(): void {
+  if (store.reply.recordingMaxTimer) {
+    clearTimeout(store.reply.recordingMaxTimer)
+    store.reply.recordingMaxTimer = null
+  }
+  if (store.reply.timeoutCoordinationTimer) {
+    clearTimeout(store.reply.timeoutCoordinationTimer)
+    store.reply.timeoutCoordinationTimer = null
+  }
 }
 
 /** dev mic の audio バッファをクリア */
