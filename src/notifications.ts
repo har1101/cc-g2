@@ -52,6 +52,14 @@ export type NotificationReplyRequest = {
   source?: 'g2' | 'web'
   /** AskUserQuestion の回答データ: { "質問テキスト": "選択ラベル" } */
   answerData?: Record<string, string>
+  // ----- Phase 5 additions (optional, backward-compatible) -----
+  /** Phase 5: required for `action='approve'` on `risk_tier='destructive'`
+   *  notifications. Without this flag the Hub force-rewrites approve → deny. */
+  two_step_confirmed?: boolean
+  /** Phase 5: identifying device id for audit logs. */
+  device_id?: string
+  /** Phase 5: client-measured latency from request to user decision (ms). */
+  latency_ms?: number
 }
 
 export type CommandRequest = {
@@ -151,9 +159,30 @@ export function createNotificationClient(baseUrl: string) {
               comment: reply.comment,
               source: reply.source,
               answerData: reply.answerData,
+              // Phase 5 optional fields. Only included when set so older
+              // tests / payloads stay byte-equal.
+              ...(reply.two_step_confirmed !== undefined ? { two_step_confirmed: reply.two_step_confirmed } : {}),
+              ...(reply.device_id !== undefined ? { device_id: reply.device_id } : {}),
+              ...(reply.latency_ms !== undefined ? { latency_ms: reply.latency_ms } : {}),
             }
       return fetchJson<NotificationReplyResponse>(
         `/api/notifications/${encodeURIComponent(id)}/reply`,
+        {
+          method: 'POST',
+          headers: createHubHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify(body),
+        },
+      )
+    },
+
+    /**
+     * Phase 5: acknowledge a hard-deny (permission-blocked) notification.
+     * The agent has already received a deny response; this call is purely
+     * for the user-facing G2 ack screen.
+     */
+    async ackBlocked(requestId: string, body: { source?: 'g2' | 'web'; device_id?: string } = {}): Promise<{ ok: boolean }> {
+      return fetchJson<{ ok: boolean }>(
+        `/api/v1/permissions/${encodeURIComponent(requestId)}/ack-blocked`,
         {
           method: 'POST',
           headers: createHubHeaders({ 'Content-Type': 'application/json' }),

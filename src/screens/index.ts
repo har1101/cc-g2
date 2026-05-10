@@ -25,6 +25,8 @@ import * as vcSendingScreen from './voice-command-sending'
 import * as vcDoneScreen from './voice-command-done'
 import * as sessionListScreen from './session-list'
 import * as sessionListCreateConfirmScreen from './session-list-create-confirm'
+import * as permissionDestructiveConfirmScreen from './permission-destructive-confirm'
+import * as actionBlockedScreen from './action-blocked'
 
 type Handler = (event: NormalizedG2Event, ctx: ScreenContext) => Promise<void>
 
@@ -44,6 +46,8 @@ const SCREEN_HANDLERS: Record<Screen, Handler> = {
   'voice-command-done': vcDoneScreen.handle,
   'session-list': sessionListScreen.handle,
   'session-list-create-confirm': sessionListCreateConfirmScreen.handle,
+  'permission-destructive-confirm': permissionDestructiveConfirmScreen.handle,
+  'action-blocked': actionBlockedScreen.handle,
 }
 
 export async function dispatchScreen(event: NormalizedG2Event, ctx: ScreenContext): Promise<void> {

@@ -9,6 +9,7 @@ import type { ScreenContext } from './types'
 import type { NormalizedG2Event } from '../even-events'
 import { isDoubleTapEventType } from '../even-events'
 import { extractAskQuestions } from './_helpers'
+import { scheduleBlockedAutoAck } from './action-blocked'
 
 export async function handle(event: NormalizedG2Event, ctx: ScreenContext): Promise<void> {
   const { store, conn, glassesUI, notifClient, log } = ctx
@@ -38,6 +39,19 @@ export async function handle(event: NormalizedG2Event, ctx: ScreenContext): Prom
     try {
       const detail = await notifClient.detail(item.id)
       store.notif.detailItem = detail
+
+      // Phase 5: permission-blocked notifications go straight to the
+      // action-blocked screen. The agent already received deny — this
+      // path is purely for the user's awareness (swipe-down ack).
+      if (detail.metadata && detail.metadata.hookType === 'permission-blocked') {
+        store.notif.screen = 'action-blocked'
+        store.notif.blocked.targetItemId = detail.id
+        await glassesUI.showActionBlocked(conn, detail)
+        scheduleBlockedAutoAck(ctx)
+        ctx.clearPendingScrollEvent()
+        ctx.updateNotifInfo()
+        return
+      }
 
       // AskUserQuestion: 詳細画面をスキップして選択肢画面へ直接遷移
       if (ctx.isAskUserQuestionNotification(detail)) {

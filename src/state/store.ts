@@ -173,6 +173,9 @@ function createStore(): Store {
     askQuestions: [],
     askQuestionIndex: 0,
     askAnswers: {},
+    // Phase 5
+    permissionConfirm: { stepCount: 0, risk_tier: null, targetItemId: null, timer: null },
+    blocked: { targetItemId: null, timer: null },
   }
 
   const reply: ReplyState = {
