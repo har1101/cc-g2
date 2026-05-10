@@ -23,7 +23,8 @@
 import type { ScreenContext } from './types'
 import type { NormalizedG2Event } from '../even-events'
 import { G2_EVENT, isDoubleTapEventType, isTapEventType } from '../even-events'
-import { getReplyResultMessage } from './_helpers'
+import { armReplyRecordingTimers, getReplyResultMessage } from './_helpers'
+import { forceFinalizeReplyAsDeny, forceFinalizeReplyAsMaxTimeout } from './reply-recording'
 
 const DESTRUCTIVE_CONFIRM_TIMEOUT_MS = 30_000
 
@@ -158,6 +159,12 @@ export async function handle(event: NormalizedG2Event, ctx: ScreenContext): Prom
       await glassesUI.ensureBasePage(conn, 'マイク録音中...')
     }
     await ctx.startReplyAudioRecording()
+    // Phase 5 §5.5: arm watchdog timers — 30s max, plus permission-timeout
+    // coordination if metadata.timeout_at is set on the notification.
+    armReplyRecordingTimers(
+      () => { void forceFinalizeReplyAsMaxTimeout(ctx) },
+      () => { void forceFinalizeReplyAsDeny(ctx, 'permission-timeout-imminent') },
+    )
     ctx.updateNotifInfo()
     return
   }
