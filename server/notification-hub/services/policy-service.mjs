@@ -129,12 +129,29 @@ export function tokenizeBash(cmd) {
       flushSegment()
       continue
     }
-    // Redirection operators terminate the current word but the redirect
-    // target follows; we keep parsing but skip the operator itself.
+    // Redirection operators are emitted as standalone tokens so the
+    // per-segment classifier can scan for `> /etc/passwd` style writes to
+    // critical paths (Phase 5 Codex pass). Recognises `>`, `>>`, `<`, `2>`,
+    // `2>>`, and `&>` (the bash combined-stream form).
     if (ch === '>' || ch === '<') {
       flushToken()
-      // capture optional trailing > for >> by leaving the chars to the next
-      // iteration — they'll just appear as a separate "token" we ignore.
+      let op = ch
+      if (ch === '>' && src[i + 1] === '>') {
+        op = '>>'
+        i++
+      }
+      argv.push(op)
+      continue
+    }
+    if ((ch === '2' || ch === '&') && src[i + 1] === '>') {
+      flushToken()
+      let op = `${ch}>`
+      i++
+      if (src[i + 1] === '>') {
+        op += '>'
+        i++
+      }
+      argv.push(op)
       continue
     }
     // Subshell delimiters: emit `(` and `)` as standalone tokens so the
@@ -374,6 +391,82 @@ function isMysqldumpAll(argv) {
 }
 
 // ---------------------------------------------------------------------------
+// Critical paths and dangerous-command helpers (Phase 5 Codex pass)
+// ---------------------------------------------------------------------------
+
+/**
+ * Match write/redirect targets that, if truncated/overwritten, brick the OS.
+ * Conservative list — `/etc`, `/boot`, `/usr`, `/bin`, `/sbin`, `/var/log`,
+ * including the directory itself and any deeper path under it.
+ */
+const CRITICAL_PATH_RE = /^\/(?:etc|boot|usr|bin|sbin|var\/log)(?:\/|$)/
+
+function targetsCriticalPath(arg) {
+  return typeof arg === 'string' && CRITICAL_PATH_RE.test(arg)
+}
+
+/** `dd if=... of=/dev/...` — disk wipe. */
+function isDdToDevice(argv) {
+  for (let i = 1; i < argv.length; i++) {
+    if (typeof argv[i] === 'string' && /^of=\/dev\//.test(argv[i])) return true
+  }
+  return false
+}
+
+/** `mkfs`, `mkfs.ext4`, `mkfs.xfs`, etc — filesystem format. */
+function isMkfsHead(head) {
+  return /^mkfs(?:\.[A-Za-z0-9._-]+)?$/.test(head)
+}
+
+/**
+ * `chmod` whose target is a top-level critical directory. We treat any
+ * positional that is exactly `/`, `/etc`, `/usr`, `/bin`, `/sbin`, or
+ * `/boot` as a lockout candidate — chmodding the directory itself is
+ * dangerous regardless of the mode string.
+ */
+function chmodTargetsCriticalRoot(argv) {
+  for (let i = 1; i < argv.length; i++) {
+    const a = argv[i]
+    if (typeof a !== 'string') continue
+    if (a === '/' || a === '/etc' || a === '/usr' || a === '/bin' || a === '/sbin' || a === '/boot') return true
+  }
+  return false
+}
+
+/** `tee /etc/passwd` etc — `tee` writes to its named files. */
+function teeWritesCriticalPath(argv) {
+  for (let i = 1; i < argv.length; i++) {
+    const a = argv[i]
+    if (typeof a !== 'string') continue
+    if (a.startsWith('-')) continue
+    if (targetsCriticalPath(a)) return true
+  }
+  return false
+}
+
+/**
+ * Scan an argv for `>`/`>>`/`2>`/`2>>`/`&>` followed by a critical-path
+ * target. The tokenizer emits these operators as standalone tokens.
+ */
+function segmentRedirectsToCriticalPath(argv) {
+  for (let i = 0; i < argv.length - 1; i++) {
+    const a = argv[i]
+    if (a === '>' || a === '>>' || a === '2>' || a === '2>>' || a === '&>') {
+      const target = argv[i + 1]
+      if (targetsCriticalPath(target)) return true
+    }
+  }
+  return false
+}
+
+/**
+ * Fork bomb: `:(){ :|:& };:` and minor whitespace variants. Detected on the
+ * raw command string before tokenization — function-definition syntax does
+ * not reduce cleanly through the argv tokenizer.
+ */
+const FORK_BOMB_RE = /:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/
+
+// ---------------------------------------------------------------------------
 // Wrapper-command recursion (Phase 5 Codex pass)
 // ---------------------------------------------------------------------------
 
@@ -503,6 +596,22 @@ export function classifyBashSegment(rawArgv, depth = 0) {
   if (head === 'kubectl' && kubectlDeleteProdNs(argv)) {
     return { tier: 'hard_deny', reason: 'hard_deny:kubectl_delete_prod_ns' }
   }
+  // Phase 5 Codex pass: dangerous-command additions.
+  if (head === 'dd' && isDdToDevice(argv)) {
+    return { tier: 'hard_deny', reason: 'hard_deny:dd_to_device' }
+  }
+  if (isMkfsHead(head)) {
+    return { tier: 'hard_deny', reason: 'hard_deny:mkfs' }
+  }
+  if (head === 'chmod' && chmodTargetsCriticalRoot(argv)) {
+    return { tier: 'hard_deny', reason: 'hard_deny:chmod_critical_root' }
+  }
+  if (head === 'tee' && teeWritesCriticalPath(argv)) {
+    return { tier: 'hard_deny', reason: 'hard_deny:tee_critical_path' }
+  }
+  if (segmentRedirectsToCriticalPath(argv)) {
+    return { tier: 'hard_deny', reason: 'hard_deny:redirect_critical_path' }
+  }
 
   // Destructive next — order is "any of these match" (intent-OR).
   if (head === 'rm' && rmHasRecursiveFlag(argv)) return { tier: 'destructive', reason: 'destructive:rm' }
@@ -529,8 +638,14 @@ export function classifyBashSegment(rawArgv, depth = 0) {
  * @returns {{ tier: 'normal' | 'destructive' | 'hard_deny', reason?: string }}
  */
 export function classifyBashCommand(cmd, depth = 0) {
+  const src = String(cmd ?? '')
+  // Fork-bomb syntax doesn't argv-tokenize cleanly — check the raw string
+  // at the top-level entry only (Phase 5 Codex pass).
+  if (depth === 0 && FORK_BOMB_RE.test(src)) {
+    return { tier: 'hard_deny', reason: 'hard_deny:fork_bomb' }
+  }
   if (depth > 8) return { tier: 'normal' } // cycle guard
-  const segments = tokenizeBash(cmd)
+  const segments = tokenizeBash(src)
   if (segments.length === 0) return { tier: 'normal' }
   /** @type {{ tier: 'normal' | 'destructive' | 'hard_deny', reason?: string }} */
   let aggregate = { tier: 'normal' }

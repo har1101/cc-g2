@@ -62,6 +62,19 @@ const HARD_DENY_FIXTURES = [
   'npx rm -rf /',
   'npm exec rm -rf /',
   'pnpm exec rm -rf /',
+  // Phase 5 Codex pass: dangerous-command additions
+  'dd if=/dev/zero of=/dev/sda',
+  'dd if=/dev/zero of=/dev/disk1',
+  'mkfs.ext4 /dev/sda1',
+  'mkfs /dev/disk1',
+  ':(){ :|:& };:',
+  'chmod 000 /',
+  'chmod -R 000 /etc',
+  '> /etc/passwd',
+  'echo "" > /etc/passwd',
+  'cat /tmp/x >> /var/log/system.log',
+  'tee /etc/passwd',
+  'echo hi | tee /etc/hosts',
 ]
 
 const DESTRUCTIVE_FIXTURES = [
