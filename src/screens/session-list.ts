@@ -67,8 +67,10 @@ export async function handle(event: NormalizedG2Event, ctx: ScreenContext): Prom
     const target = store.sessionList.sessions[idx - 1]
     if (!target) return
     log(`SessionList: activate session id=${target.session_id} label=${target.label}`)
+    let activated = false
     try {
       await notifClient.activateSession(target.session_id)
+      activated = true
       // Phase 4: optimistically reflect the new active id so the pending-count
       // polling cycle doesn't render the previous active session for one tick.
       setActiveSessionId(target.session_id)
@@ -92,7 +94,11 @@ export async function handle(event: NormalizedG2Event, ctx: ScreenContext): Prom
     } catch (err) {
       log(`SessionList: activate失敗: ${err instanceof Error ? err.message : String(err)}`)
     }
-    await ctx.enterIdleScreen('SessionList: activated session')
+    // Codex 4 #6/#8: distinguish success vs failure exit reason so upstream
+    // tracing isn't misled by a hard-coded "activated session" string.
+    await ctx.enterIdleScreen(
+      activated ? 'SessionList: activated session' : 'SessionList: activate failed',
+    )
     return
   }
 

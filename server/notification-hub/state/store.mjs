@@ -139,6 +139,13 @@ export function listPendingApprovalsForSession(sessionId) {
  * non-active rows). Notifications without an agentSessionId are bucketed
  * under the literal id 'unknown' and surfaced like any other session.
  *
+ * Codex 4 #4: when `activeSessionId` is null/undefined (no session pinned
+ * as active), the truthy guard short-circuits and ALL pending approvals
+ * are counted, including ones that would belong to an active session if
+ * one were selected. This is intentional — the SessionList shows badges
+ * for every session with pending work when no row is active — but it is
+ * a subtle behavior worth pinning in tests if it ever changes.
+ *
  * @param {string | null} activeSessionId
  * @returns {Map<string, number>}
  */
