@@ -7,6 +7,7 @@
 // the cfg parameter so this module stays free of upward imports.
 import { randomUUID } from 'node:crypto'
 import { log } from '../core/log.mjs'
+import { writeAuditEntry } from '../core/audit-log.mjs'
 import { normalizeMoshiPayload, persistedNotification } from '../notification-utils.mjs'
 import * as store from '../state/store.mjs'
 import { appendJsonl } from '../state/persistence.mjs'
@@ -179,9 +180,51 @@ export async function processReply(input, cfg) {
     return { status: 400, body: { ok: false, error: 'Invalid JSON body' } }
   }
   const replyTextRaw = typeof body.replyText === 'string' ? body.replyText : ''
-  const action = typeof body.action === 'string' ? body.action : ''
-  const comment = typeof body.comment === 'string' ? body.comment : ''
+  let action = typeof body.action === 'string' ? body.action : ''
+  let comment = typeof body.comment === 'string' ? body.comment : ''
   const source = typeof body.source === 'string' ? body.source : ''
+  const twoStepConfirmed = body.two_step_confirmed === true
+  const deviceId = typeof body.device_id === 'string' ? body.device_id : undefined
+  const latencyMs = typeof body.latency_ms === 'number' && Number.isFinite(body.latency_ms)
+    ? body.latency_ms
+    : undefined
+
+  // Phase 5 §5.3: server-side guard for destructive 2-step. If the linked
+  // notification is risk_tier=='destructive' and the client says approve
+  // without two_step_confirmed, force-rewrite to deny + audit-log
+  // forced_deny:no_two_step. The rewrite happens before any action dispatch
+  // so all downstream branches (resolveApproval / relay / persist) see deny.
+  let forcedDenyApplied = false
+  if (action === 'approve' && !twoStepConfirmed) {
+    const riskTier = item.metadata && typeof item.metadata.risk_tier === 'string'
+      ? item.metadata.risk_tier
+      : null
+    if (riskTier === 'destructive') {
+      const requestId = item.metadata && typeof item.metadata.request_id === 'string'
+        ? item.metadata.request_id
+        : undefined
+      const agentSessionId = item.metadata && typeof item.metadata.agentSessionId === 'string'
+        ? item.metadata.agentSessionId
+        : undefined
+      log(`approval-broker forced_deny:no_two_step notificationId=${notificationId} action=${action}→deny`)
+      writeAuditEntry({
+        event: 'permission.forced_deny',
+        request_id: requestId,
+        agent_session_id: agentSessionId,
+        tool_name: item.metadata && item.metadata.toolName,
+        reason: 'forced_deny:no_two_step',
+        device_id: deviceId,
+        source,
+      })
+      action = 'deny'
+      // Preserve the original intent in the comment so the agent / human
+      // reviewing the audit log can see "the user tried to approve without
+      // the 2-step confirm".
+      const note = '[forced_deny:no_two_step] approve attempt without two_step_confirmed'
+      comment = comment ? `${comment} ${note}` : note
+      forcedDenyApplied = true
+    }
+  }
 
   // answerData バリデーション: plain object, キー/値とも string, 上限付き
   let answerData = undefined
@@ -385,6 +428,31 @@ export async function processReply(input, cfg) {
   log(
     `reply accepted id=${record.id} notificationId=${record.notificationId} status=${record.status}${record.action ? ` action=${record.action}` : ''}${record.error ? ` error=${record.error}` : ''}`,
   )
+
+  // Phase 5: emit permission.answered for every approval-bound reply so the
+  // audit log captures the final decision (post-rewrite if forced_deny was
+  // applied). Non-approval notifications (plain MOSHI replies) skip this.
+  if (isApprovalNotification) {
+    const requestId = item.metadata && typeof item.metadata.request_id === 'string'
+      ? item.metadata.request_id
+      : undefined
+    const agentSessionId = item.metadata && typeof item.metadata.agentSessionId === 'string'
+      ? item.metadata.agentSessionId
+      : undefined
+    writeAuditEntry({
+      event: 'permission.answered',
+      request_id: requestId,
+      agent_session_id: agentSessionId,
+      tool_name: item.metadata && item.metadata.toolName,
+      decision: record.resolvedAction || record.action || null,
+      two_step_confirmed: twoStepConfirmed,
+      forced_deny: forcedDenyApplied || undefined,
+      device_id: deviceId,
+      latency_ms: latencyMs,
+      source: source || undefined,
+    })
+  }
+
   return { status: 200, body: { ok: true, reply: record } }
 }
 
