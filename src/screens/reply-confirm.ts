@@ -11,7 +11,8 @@
 
 import type { ScreenContext } from './types'
 import type { NormalizedG2Event } from '../even-events'
-import { isAskUserQuestionNotification, getReplyResultMessage } from './_helpers'
+import { armReplyRecordingTimers, isAskUserQuestionNotification, getReplyResultMessage } from './_helpers'
+import { forceFinalizeReplyAsDeny, forceFinalizeReplyAsMaxTimeout } from './reply-recording'
 
 async function returnToPrePreviousScreen(ctx: ScreenContext): Promise<void> {
   const { store, conn, glassesUI } = ctx
@@ -89,6 +90,14 @@ export async function handle(event: NormalizedG2Event, ctx: ScreenContext): Prom
     store.notif.replyText = ''
     await glassesUI.showReplyRecording(conn)
     await ctx.startReplyAudioRecording()
+    // Phase 5 Codex pass: the initial-entry path in detail-actions.ts arms
+    // these watchdog timers (30s max + permission-timeout coordination).
+    // The re-record branch was missing them, so a retry that hit either
+    // limit silently stuck the recording state. Mirror the same wiring.
+    armReplyRecordingTimers(
+      () => { void forceFinalizeReplyAsMaxTimeout(ctx) },
+      () => { void forceFinalizeReplyAsDeny(ctx, 'permission-timeout-imminent') },
+    )
     ctx.updateNotifInfo()
     return
   }
