@@ -1,6 +1,10 @@
 // JSONL persistence and bootstrap (replay-on-start) for the in-memory store.
 // Files are append-only; bootstrap reconstructs the store from disk.
-import { mkdir, readFile, appendFile } from 'node:fs/promises'
+//
+// Phase 3 adds a sessions.json *snapshot* (full overwrite on each change) for
+// the AgentSession registry, since session lifecycles are short and we always
+// want a complete current view rather than an event log.
+import { mkdir, readFile, appendFile, writeFile, rename } from 'node:fs/promises'
 import path from 'node:path'
 import { log } from '../core/log.mjs'
 import * as store from './store.mjs'
@@ -16,6 +20,7 @@ export function buildPaths(opts) {
     repliesFile: path.join(dataDir, 'replies.jsonl'),
     clientEventsFile: path.join(dataDir, 'client-events.jsonl'),
     approvalsFile: path.join(dataDir, 'approvals.jsonl'),
+    sessionsFile: path.join(dataDir, 'sessions.json'),
   }
 }
 
@@ -39,6 +44,43 @@ async function loadJsonl(filePath) {
 
 export async function appendJsonl(filePath, obj) {
   await appendFile(filePath, `${JSON.stringify(obj)}\n`, 'utf8')
+}
+
+/**
+ * Atomically write a JSON snapshot via tmp file + rename.
+ * Used by sessions.json (Phase 3) where we always want the full current view.
+ *
+ * Codex 3 #4: two concurrent calls to the same `filePath` shared the same
+ * `${filePath}.tmp` and could race at the filesystem layer. We now serialize
+ * writes per-`filePath` through an in-memory promise chain so a stale earlier
+ * snapshot can't overwrite a newer one. (Cross-process serialization would
+ * require flock; Phase 3 runs single-process so the in-memory chain is enough.)
+ */
+const snapshotChains = new Map()
+export async function writeJsonSnapshot(filePath, obj) {
+  const prev = snapshotChains.get(filePath) || Promise.resolve()
+  const next = prev.then(async () => {
+    const tmp = `${filePath}.tmp`
+    await writeFile(tmp, `${JSON.stringify(obj, null, 2)}\n`, 'utf8')
+    await rename(tmp, filePath)
+  })
+  // Keep the chain alive but don't hold onto rejections — clear on settle.
+  const tracked = next.catch(() => {})
+  snapshotChains.set(filePath, tracked)
+  tracked.then(() => {
+    if (snapshotChains.get(filePath) === tracked) snapshotChains.delete(filePath)
+  })
+  return next
+}
+
+async function loadJsonSnapshot(filePath) {
+  try {
+    const raw = await readFile(filePath, 'utf8')
+    return JSON.parse(raw)
+  } catch (err) {
+    if (err && typeof err === 'object' && 'code' in err && err.code === 'ENOENT') return null
+    throw err
+  }
 }
 
 /**
@@ -82,7 +124,21 @@ export async function bootstrap(paths) {
       }
     }
   }
+  // Phase 3: restore AgentSession registry from sessions.json snapshot.
+  if (paths.sessionsFile) {
+    const snapshot = await loadJsonSnapshot(paths.sessionsFile)
+    if (snapshot && Array.isArray(snapshot.sessions)) {
+      for (const s of snapshot.sessions) {
+        if (s && typeof s === 'object' && typeof s.session_id === 'string') {
+          store.sessions.set(s.session_id, s)
+        }
+      }
+    }
+    if (snapshot && typeof snapshot.activeSessionId === 'string') {
+      store.setActiveSessionId(snapshot.activeSessionId)
+    }
+  }
   log(
-    `notification-hub loaded notifications=${store.notifications.length} replies=${store.replies.length} approvals=${store.approvals.length} dataDir=${paths.dataDir}`,
+    `notification-hub loaded notifications=${store.notifications.length} replies=${store.replies.length} approvals=${store.approvals.length} sessions=${store.sessions.size} dataDir=${paths.dataDir}`,
   )
 }

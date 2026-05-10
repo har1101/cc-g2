@@ -71,6 +71,9 @@ export const config = {
     Number.parseInt(process.env.HUB_MAX_BODY_BYTES || '1048576', 10) || 1048576,
   ),
   hubMaxSttBodyBytes: 0, // patched below to honor the (max-body, env) ceiling
+  // Phase 3: SessionList project allowlist + cc-g2.sh path used by createSession.
+  projectsFile: path.resolve(process.env.CC_G2_PROJECTS_FILE || 'server/config/projects.json'),
+  ccG2ScriptPath: path.resolve(process.env.CC_G2_LAUNCH_SCRIPT || 'scripts/cc-g2.sh'),
 }
 config.hubMaxSttBodyBytes = Math.max(
   config.hubMaxBodyBytes,

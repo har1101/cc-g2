@@ -61,9 +61,12 @@ function screenLabel(screen: NotificationUIState['screen']): string {
     case 'reply-confirm': return 'confirm'
     case 'reply-sending': return 'sending'
     case 'voice-command-recording': return 'vc-rec'
+    case 'voice-command-recording-streaming': return 'vc-rec-s'
     case 'voice-command-confirm': return 'vc-conf'
     case 'voice-command-sending': return 'vc-send'
     case 'voice-command-done': return 'vc-done'
+    case 'session-list': return 'sessions'
+    case 'session-list-create-confirm': return 'sess-new'
   }
 }
 
@@ -94,16 +97,20 @@ function setPill(id: string, text: string, tone: 'neutral' | 'ok' | 'warn' | 'er
 }
 
 function canAutoOpenForScreen(screen: NotificationUIState['screen']): boolean {
-  // 録音/送信/voice-command 中は割り込まない。他の画面では新着優先で一覧へ寄せる。
+  // 録音/送信/voice-command/SessionList 中は割り込まない。
+  // 他の画面では新着優先で一覧へ寄せる。
   return (
     screen !== 'reply-recording' &&
     screen !== 'reply-confirm' &&
     screen !== 'reply-sending' &&
     screen !== 'ask-question' &&
     screen !== 'voice-command-recording' &&
+    screen !== 'voice-command-recording-streaming' &&
     screen !== 'voice-command-confirm' &&
     screen !== 'voice-command-sending' &&
-    screen !== 'voice-command-done'
+    screen !== 'voice-command-done' &&
+    screen !== 'session-list' &&
+    screen !== 'session-list-create-confirm'
   )
 }
 
@@ -313,6 +320,24 @@ export function createNotificationController(deps: NotificationControllerDeps): 
       infoEl.textContent = '[音声コマンド送信中...]'
     } else if (notifState.screen === 'voice-command-done') {
       infoEl.textContent = '[音声コマンド完了]'
+    } else if (notifState.screen === 'session-list') {
+      const sessions = store.sessionList.sessions
+      const lines = ['[SessionList]', '0> ↓ Pull to create new']
+      sessions.forEach((s, i) => {
+        const sel = i + 1 === store.sessionList.selectedIndex ? '>' : ' '
+        lines.push(`${sel}${i + 1} ${s.label} [${s.status}]`)
+      })
+      lines.push('Tap=open / DblTap=back / Pull=create')
+      infoEl.textContent = lines.join('\n')
+    } else if (notifState.screen === 'session-list-create-confirm') {
+      const choices = store.sessionList.projects.filter((p) => p.project_id !== '_unmanaged')
+      const cur = choices[store.sessionList.selectedProjectIndex]
+      infoEl.textContent = [
+        '[Create new session]',
+        cur ? `→ ${cur.label} (${cur.default_backend})` : '(no projects)',
+        `${choices.length === 0 ? 0 : store.sessionList.selectedProjectIndex + 1}/${choices.length}`,
+        'Swipe=cycle / Tap=Create / DblTap=Cancel',
+      ].join('\n')
     }
     updateDashboard()
   }

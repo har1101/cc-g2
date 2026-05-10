@@ -243,6 +243,32 @@ export async function enterIdleScreen(reason: string): Promise<void> {
   d.log(`${reason} (idle reopen blocked ${IDLE_REOPEN_COOLDOWN_MS}ms)`)
 }
 
+/**
+ * Phase 3: enter the SessionList screen. Lazily fetches projects/sessions
+ * from the Hub. The dashboard controller calls this when the user clicks
+ * the "Sessions" button, and screen handlers can call it from G2 too if a
+ * later UX iteration adds a sentinel.
+ */
+export async function enterSessionListScreen(reason: string): Promise<void> {
+  const d = need()
+  const conn = d.getConnection()
+  if (!conn) return
+  try {
+    if (store.sessionList.projects.length === 0) {
+      store.sessionList.projects = await d.notifClient.listProjects()
+    }
+    store.sessionList.sessions = await d.notifClient.listSessions()
+  } catch (err) {
+    d.log(`SessionList: 初期取得失敗 ${err instanceof Error ? err.message : String(err)}`)
+  }
+  store.sessionList.selectedIndex = 0
+  store.sessionList.screen = 'session-list'
+  store.notif.screen = 'session-list'
+  await d.glassesUI.showSessionList(conn, store.sessionList.sessions, 0)
+  d.updateNotifInfo()
+  d.log(`SessionList enter (${reason})`)
+}
+
 // ---------------------------------------------------------------------------
 // reply (permission コメント) 録音
 // ---------------------------------------------------------------------------

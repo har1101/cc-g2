@@ -68,6 +68,33 @@ export type CommandResponse = {
   error?: string
 }
 
+// ---------------------------------------------------------------------------
+// Phase 3: SessionList API types
+// ---------------------------------------------------------------------------
+
+/**
+ * Public projection of a project allowlist entry — `path` is server-side only
+ * and never appears here. Returned by GET /api/v1/projects.
+ */
+export type ProjectMeta = {
+  project_id: string
+  label: string
+  default_backend: 'claude-code' | 'codex-cli'
+  start_template: 'claude' | 'codex'
+}
+
+export type AgentSession = {
+  session_id: string
+  label: string
+  backend: 'claude-code' | 'codex-cli'
+  project_id: string
+  tmux_target: string
+  status: 'idle' | 'working' | 'permission' | 'done' | 'error'
+  created_at: string
+  updated_at: string
+  source: 'pull-to-new-session' | 'voice-entry' | 'manual'
+}
+
 export function createNotificationClient(baseUrl: string) {
   async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
     const res = await fetch(`${baseUrl}${path}`, init)
@@ -121,6 +148,48 @@ export function createNotificationClient(baseUrl: string) {
         headers: createHubHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify(req),
       })
+    },
+
+    // ----- Phase 3: SessionList API -----
+
+    async listProjects(): Promise<ProjectMeta[]> {
+      const res = await fetchJson<{ ok: boolean; items: ProjectMeta[] }>(
+        '/api/v1/projects',
+        { headers: createHubHeaders() },
+      )
+      return res.items || []
+    },
+
+    async listSessions(): Promise<AgentSession[]> {
+      const res = await fetchJson<{ ok: boolean; items: AgentSession[] }>(
+        '/api/v1/sessions',
+        { headers: createHubHeaders() },
+      )
+      return res.items || []
+    },
+
+    async createSession(projectId: string, labelHint?: string): Promise<AgentSession> {
+      const res = await fetchJson<{ ok: boolean; session: AgentSession }>(
+        '/api/v1/sessions',
+        {
+          method: 'POST',
+          headers: createHubHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify({ project_id: projectId, label_hint: labelHint }),
+        },
+      )
+      return res.session
+    },
+
+    async activateSession(sessionId: string): Promise<AgentSession> {
+      const res = await fetchJson<{ ok: boolean; session: AgentSession }>(
+        `/api/v1/sessions/${encodeURIComponent(sessionId)}/activate`,
+        {
+          method: 'POST',
+          headers: createHubHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify({}),
+        },
+      )
+      return res.session
     },
   }
 }

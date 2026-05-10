@@ -88,4 +88,8 @@ export type ScreenContext = {
 
   // ----- AskUserQuestion / 結果メッセージ -----
   isAskUserQuestionNotification(detail: NotificationDetail): boolean
+
+  // ----- Phase 3: SessionList -----
+  /** Hub から projects / sessions を fetch して SessionList 画面に入る */
+  enterSessionListScreen(reason: string): Promise<void>
 }

@@ -13,6 +13,7 @@
 import type { EvenHubEvent } from '@evenrealities/even_hub_sdk'
 import type { NotificationUIState } from '../glasses-ui'
 import type { WebSpeechSession } from '../stt/webspeech'
+import type { AgentSession, ProjectMeta } from '../notifications'
 
 export type ContextSession = {
   sessionId: string
@@ -109,6 +110,27 @@ export type ContextState = {
   latestPct: number | undefined
 }
 
+/**
+ * Phase 3: SessionList screen state.
+ *
+ * `sessions` / `projects` are populated lazily on entry to the SessionList
+ * screen (or by the polling controller), then mutated in place on user
+ * actions. `screen` mirrors the active sub-screen so handlers can dispatch on
+ * a single field — the global `notif.screen` carries 'session-list' or
+ * 'session-list-create-confirm' to plug into the existing dispatcher.
+ */
+export type SessionListState = {
+  /** sub-screen marker — keeps create-confirm logic next to the list view */
+  screen: 'session-list' | 'session-list-create-confirm'
+  sessions: AgentSession[]
+  /** index 0 == sentinel "↓ Pull to create new" */
+  selectedIndex: number
+  pendingCreate: boolean
+  projects: ProjectMeta[]
+  selectedProjectIndex: number
+  createConfirmTimer: ReturnType<typeof setTimeout> | null
+}
+
 export type Store = {
   notif: NotificationUIState
   reply: ReplyState
@@ -118,6 +140,7 @@ export type Store = {
   idle: IdleState
   eventQueue: EventQueueState
   context: ContextState
+  sessionList: SessionListState
 }
 
 /** 既定値で store を生成。 main.ts は import 時にこのインスタンスをそのまま使う。 */
@@ -206,7 +229,17 @@ function createStore(): Store {
     latestPct: undefined,
   }
 
-  return { notif, reply, voice, dev, dashboard, idle, eventQueue, context }
+  const sessionList: SessionListState = {
+    screen: 'session-list',
+    sessions: [],
+    selectedIndex: 0,
+    pendingCreate: false,
+    projects: [],
+    selectedProjectIndex: 0,
+    createConfirmTimer: null,
+  }
+
+  return { notif, reply, voice, dev, dashboard, idle, eventQueue, context, sessionList }
 }
 
 export const store: Store = createStore()
@@ -281,5 +314,13 @@ export function cancelIdleSingleTapTimer(): void {
   if (store.idle.singleTapTimer) {
     clearTimeout(store.idle.singleTapTimer)
     store.idle.singleTapTimer = null
+  }
+}
+
+/** Phase 3: SessionList — clear the create-confirm auto-cancel timer */
+export function clearSessionListCreateConfirmTimer(): void {
+  if (store.sessionList.createConfirmTimer) {
+    clearTimeout(store.sessionList.createConfirmTimer)
+    store.sessionList.createConfirmTimer = null
   }
 }

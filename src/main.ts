@@ -19,6 +19,7 @@ import {
   shouldIgnoreDetailScroll,
   clearPendingScrollEvent,
   enterIdleScreen,
+  enterSessionListScreen,
   returnToListFromResult,
   startReplyAudioRecording,
   stopReplyAudioRecording,
@@ -56,6 +57,7 @@ appRoot.innerHTML = `
       <button id="connect-btn" class="btn btn-primary" type="button">Connect Glasses</button>
       <button id="notif-fetch-btn" class="btn" type="button">Refresh Notifications</button>
       <button id="notif-show-g2-btn" class="btn" type="button" disabled>Open On G2</button>
+      <button id="sessions-show-g2-btn" class="btn" type="button" disabled>Open Sessions</button>
     </div>
     <div class="status-grid">
       <div class="status-block">
@@ -227,6 +229,7 @@ function buildScreenContext(): ScreenContext {
     startReplyAudioRecording,
     stopReplyAudioRecording,
     isAskUserQuestionNotification,
+    enterSessionListScreen,
   }
 }
 
@@ -298,11 +301,33 @@ document.getElementById('connect-btn')!.addEventListener('click', async () => {
     }
     ensureNotifEventHandler(connection)
     notifController.startNotificationPolling()
+    document.getElementById('sessions-show-g2-btn')?.removeAttribute('disabled')
   } catch (err) {
     notifController.setConnectionPill('接続失敗', 'error')
     log(`接続失敗: ${err}`)
   }
 })
+
+// Phase 3: SessionList entry point. Click handler stays here (not in
+// notification-controller) because it is a sibling to Connect Glasses, lives
+// outside the notification list lifecycle, and depends on enterSessionListScreen
+// which is bound to the screen helpers wired below.
+const sessionsBtn = document.getElementById('sessions-show-g2-btn')
+if (sessionsBtn) {
+  sessionsBtn.addEventListener('click', async () => {
+    if (!connection) {
+      log('未接続です。先にConnectしてください。')
+      return
+    }
+    sessionsBtn.removeAttribute('disabled')
+    ensureNotifEventHandler(connection)
+    try {
+      await enterSessionListScreen('dashboard button')
+    } catch (err) {
+      log(`SessionList起動失敗: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  })
+}
 
 wireDevTools({
   getConnection: () => connection,

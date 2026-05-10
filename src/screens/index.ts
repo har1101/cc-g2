@@ -23,6 +23,8 @@ import * as vcRecordingStreamingScreen from './voice-command-recording-streaming
 import * as vcConfirmScreen from './voice-command-confirm'
 import * as vcSendingScreen from './voice-command-sending'
 import * as vcDoneScreen from './voice-command-done'
+import * as sessionListScreen from './session-list'
+import * as sessionListCreateConfirmScreen from './session-list-create-confirm'
 
 type Handler = (event: NormalizedG2Event, ctx: ScreenContext) => Promise<void>
 
@@ -40,6 +42,8 @@ const SCREEN_HANDLERS: Record<Screen, Handler> = {
   'voice-command-confirm': vcConfirmScreen.handle,
   'voice-command-sending': vcSendingScreen.handle,
   'voice-command-done': vcDoneScreen.handle,
+  'session-list': sessionListScreen.handle,
+  'session-list-create-confirm': sessionListCreateConfirmScreen.handle,
 }
 
 export async function dispatchScreen(event: NormalizedG2Event, ctx: ScreenContext): Promise<void> {
