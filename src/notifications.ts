@@ -211,5 +211,29 @@ export function createNotificationClient(baseUrl: string) {
       )
       return res.session
     },
+
+    /**
+     * Phase 4: GET /api/v1/sessions/active-summary
+     *
+     * Returns the Hub's current active_session_id (or null) and a map of
+     * pending-approval counts keyed by AgentSession id, excluding the active
+     * session. The polling controller hits this each tick so SessionList can
+     * render `(active)` + `(N pending)` badges without computing counts
+     * client-side from the full notifications list.
+     */
+    async fetchActiveSummary(): Promise<{
+      activeSessionId: string | null
+      pendingCountsByOtherSession: Record<string, number>
+    }> {
+      const res = await fetchJson<{
+        ok: boolean
+        active_session_id: string | null
+        pending_counts_by_other_session: Record<string, number>
+      }>('/api/v1/sessions/active-summary', { headers: createHubHeaders() })
+      return {
+        activeSessionId: res.active_session_id || null,
+        pendingCountsByOtherSession: res.pending_counts_by_other_session || {},
+      }
+    },
   }
 }

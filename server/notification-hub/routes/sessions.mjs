@@ -1,13 +1,15 @@
 // Phase 3: SessionList API routes.
-//   GET  /api/v1/projects                 — list public projects (no path)
-//   GET  /api/v1/sessions                 — list AgentSessions
-//   POST /api/v1/sessions                 — create session via cc-g2.sh
-//   POST /api/v1/sessions/register        — idempotent registration (Voice Entry)
-//   POST /api/v1/sessions/:id/activate    — mark active session
+//   GET  /api/v1/projects                       — list public projects (no path)
+//   GET  /api/v1/sessions                       — list AgentSessions
+//   GET  /api/v1/sessions/active-summary        — Phase 4: active id + pending counts
+//   POST /api/v1/sessions                       — create session via cc-g2.sh
+//   POST /api/v1/sessions/register              — idempotent registration (Voice Entry)
+//   POST /api/v1/sessions/:id/activate          — mark active session
 //
 // project_path is server-side only and never appears in any response body.
 import { readRequestBody, safeJsonParse } from '../notification-utils.mjs'
 import { isBodyTooLargeError, sendJson, sendRequestBodyTooLarge } from '../core/http.mjs'
+import { getActiveSessionId, pendingApprovalCountByOtherSessions } from '../state/store.mjs'
 
 function matchActivatePath(pathname) {
   const m = pathname.match(/^\/api\/v1\/sessions\/([^/]+)\/activate$/)
@@ -49,6 +51,26 @@ export async function handle(req, res, ctx) {
 
   if (method === 'GET' && pathname === '/api/v1/sessions') {
     sendJson(res, 200, { ok: true, items: sessionService.listSessions() })
+    return true
+  }
+
+  // Phase 4: lightweight summary used by the frontend polling controller to
+  // render `(N pending)` badges + `(active)` marker without two round trips.
+  // Returns the current activeSessionId (server-side source of truth) plus a
+  // map of pending-approval counts keyed by AgentSession id (excluding the
+  // active session). Notifications without an agentSessionId are bucketed
+  // under the literal string 'unknown' — see store.pendingApprovalCount...().
+  if (method === 'GET' && pathname === '/api/v1/sessions/active-summary') {
+    const activeSessionId = getActiveSessionId()
+    const counts = pendingApprovalCountByOtherSessions(activeSessionId)
+    /** @type {Record<string, number>} */
+    const pending_counts_by_other_session = {}
+    for (const [sid, n] of counts) pending_counts_by_other_session[sid] = n
+    sendJson(res, 200, {
+      ok: true,
+      active_session_id: activeSessionId,
+      pending_counts_by_other_session,
+    })
     return true
   }
 
