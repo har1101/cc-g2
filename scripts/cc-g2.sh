@@ -135,6 +135,28 @@ resolve_groq_api_key() {
   printf '%s' "$value"
 }
 
+resolve_deepgram_api_key() {
+  if [ -n "${DEEPGRAM_API_KEY:-}" ]; then
+    printf '%s' "$DEEPGRAM_API_KEY"
+    return
+  fi
+  local value=""
+  value="$(read_env_file_var "$G2_PROJECT_DIR/.env.local" "DEEPGRAM_API_KEY" || true)"
+  [ -n "$value" ] || value="$(read_env_file_var "$G2_PROJECT_DIR/.env" "DEEPGRAM_API_KEY" || true)"
+  printf '%s' "$value"
+}
+
+resolve_stt_engine_voice_command() {
+  if [ -n "${VITE_STT_ENGINE_VOICE_COMMAND:-}" ]; then
+    printf '%s' "$VITE_STT_ENGINE_VOICE_COMMAND"
+    return
+  fi
+  local value=""
+  value="$(read_env_file_var "$G2_PROJECT_DIR/.env.local" "VITE_STT_ENGINE_VOICE_COMMAND" || true)"
+  [ -n "$value" ] || value="$(read_env_file_var "$G2_PROJECT_DIR/.env" "VITE_STT_ENGINE_VOICE_COMMAND" || true)"
+  printf '%s' "$value"
+}
+
 resolve_statusline_flag() {
   if [ -n "${CC_G2_ENABLE_STATUSLINE:-}" ]; then
     printf '%s' "$CC_G2_ENABLE_STATUSLINE"
@@ -224,6 +246,8 @@ resolve_repo_roots() {
 }
 
 GROQ_API_KEY_RESOLVED="$(resolve_groq_api_key)"
+DEEPGRAM_API_KEY_RESOLVED="$(resolve_deepgram_api_key)"
+STT_ENGINE_VOICE_COMMAND_RESOLVED="$(resolve_stt_engine_voice_command)"
 ENABLE_STATUSLINE="$(resolve_statusline_flag)"
 VOICE_ENTRY_ENABLED="$(resolve_voice_entry_enabled)"
 VOICE_ENTRY_REPO_ROOTS="$(resolve_repo_roots)"
@@ -635,6 +659,7 @@ ensure_infra() {
       HUB_PORT=$HUB_PORT \
       HUB_AUTH_TOKEN="$HUB_AUTH_TOKEN" \
       GROQ_API_KEY="$GROQ_API_KEY_RESOLVED" \
+      DEEPGRAM_API_KEY="$DEEPGRAM_API_KEY_RESOLVED" \
       HUB_ALLOWED_ORIGINS="$allowed_origins" \
       HUB_REPLY_RELAY_CMD='bash server/notification-hub/reply-relay.sh' \
       RELAY_ENABLE_TMUX=1 \
@@ -670,6 +695,7 @@ ensure_infra() {
     local vite_log="${G2_PROJECT_DIR}/tmp/notification-hub/vite.log"
     nohup env -C "$G2_PROJECT_DIR" \
       VITE_HUB_TOKEN="$HUB_AUTH_TOKEN" \
+      VITE_STT_ENGINE_VOICE_COMMAND="$STT_ENGINE_VOICE_COMMAND_RESOLVED" \
       ./node_modules/.bin/vite --host 0.0.0.0 --port "$VITE_PORT" \
       >> "$vite_log" 2>&1 &
 

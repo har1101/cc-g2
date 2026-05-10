@@ -25,12 +25,17 @@ describe('even-events', () => {
     expect(normalized.inferredIndex).toBe(false)
   })
 
-  it('treats sys events without eventType as unknown', () => {
+  it('treats EMPTY sys events (no eventType) as tap', () => {
+    // SDK quirk: a tap on screens whose active container is text-only (e.g.,
+    // notification-actions) arrives as `sysEvent: {}` with no eventType.
+    // Same loss-of-eventType pattern as the CLICK_EVENT(0) workaround for
+    // text/list sources. Treating it as a tap unblocks Phase 5's v3 input
+    // model (single tap = voice comment substate on detail-actions).
     const normalized = normalizeHubEvent({
       sysEvent: {},
     })
 
-    expect(normalized.kind).toBe('unknown')
+    expect(normalized.kind).toBe('tap')
     expect(normalized.source).toBe('sys')
   })
 

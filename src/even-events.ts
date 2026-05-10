@@ -81,6 +81,19 @@ export function normalizeHubEvent(event: HubEventLike): NormalizedG2Event {
   else if (eventType === G2_EVENT.DOUBLE_CLICK) kind = 'doubleTap'
   else if (eventType === G2_EVENT.SCROLL_TOP) kind = 'scrollTop'
   else if (eventType === G2_EVENT.SCROLL_BOTTOM) kind = 'scrollBottom'
+  // Phase 5 follow-up: SDK emits an EMPTY `sysEvent: {}` (no eventType) for
+  // taps on screens that don't have an active text/list container (e.g., the
+  // notification-actions screen rebuilt with text-only containers). The
+  // existing eventType=undefined→tap fallback only fired for text/list
+  // sources, so these taps were silently ignored. Treat empty sysEvent as a
+  // tap as well — same intent as the CLICK_EVENT(0) loss workaround.
+  else if (
+    eventType === undefined &&
+    primary.source === 'sys' &&
+    Object.keys(primary.value || {}).length === 0
+  ) {
+    kind = 'tap'
+  }
 
   return {
     eventType,
