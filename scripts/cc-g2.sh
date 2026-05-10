@@ -606,13 +606,14 @@ ensure_infra() {
     local hub_log="${G2_PROJECT_DIR}/tmp/notification-hub/hub.log"
     local allowed_origins="http://127.0.0.1:${VITE_PORT},http://localhost:${VITE_PORT}"
     local ts_ip
-    ts_ip=$(tailscale ip -4 2>/dev/null || true)
+    ts_ip=$(tailscale ip -4 2>/dev/null | head -n1 || true)
     if [ -n "$ts_ip" ]; then
       allowed_origins="${allowed_origins},http://${ts_ip}:${VITE_PORT}"
     fi
     mkdir -p "$(dirname "$hub_log")"
     nohup env -C "$G2_PROJECT_DIR" \
-      HUB_BIND=0.0.0.0 \
+      HUB_BIND_MODE="${HUB_BIND_MODE:-tailnet}" \
+      HUB_TAILSCALE_IP="$ts_ip" \
       HUB_PORT=$HUB_PORT \
       HUB_AUTH_TOKEN="$HUB_AUTH_TOKEN" \
       GROQ_API_KEY="$GROQ_API_KEY_RESOLVED" \
@@ -780,6 +781,27 @@ cmd_doctor() {
       warn "Hub auth token: mismatch (run cc-g2 !)"
       ok=false
     fi
+    local doctor_bind_mode="${HUB_BIND_MODE:-tailnet}"
+    local doctor_ts_ip
+    doctor_ts_ip=$(tailscale ip -4 2>/dev/null | head -n1 || true)
+    case "$doctor_bind_mode" in
+      tailnet)
+        if [ -n "$doctor_ts_ip" ]; then
+          info "Hub bind mode: tailnet (loopback + ${doctor_ts_ip})"
+        else
+          warn "Hub bind mode: tailnet (loopback only — Tailscale IP unavailable)"
+        fi
+        ;;
+      localhost)
+        info "Hub bind mode: localhost (phone access disabled)"
+        ;;
+      any)
+        warn "Hub bind mode: any (debug — exposed to all interfaces)"
+        ;;
+      *)
+        warn "Hub bind mode: ${doctor_bind_mode} (unknown — falls back to tailnet at runtime)"
+        ;;
+    esac
     warn "Hub is intended for Tailscale/local trusted networks only"
   else
     warn "Hub (port $HUB_PORT): stopped"

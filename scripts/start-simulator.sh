@@ -40,6 +40,8 @@ resolve_groq_api_key() {
 
 GROQ_API_KEY_RESOLVED="$(resolve_groq_api_key)"
 
+ts_ip="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
+
 mkdir -p "$CACHE_DIR" "$LOG_DIR"
 
 if [ -z "$HUB_AUTH_TOKEN" ] && [ -f "$HUB_AUTH_TOKEN_FILE" ]; then
@@ -50,9 +52,12 @@ fi
 if ! curl -s --max-time 1 "http://127.0.0.1:${HUB_PORT}/api/health" >/dev/null 2>&1; then
   echo "[start] Notification Hub on ${HUB_PORT}"
   ALLOWED_ORIGINS="http://127.0.0.1:${PORT},http://localhost:${PORT}"
+  if [ -n "$ts_ip" ]; then
+    ALLOWED_ORIGINS="${ALLOWED_ORIGINS},http://${ts_ip}:${PORT}"
+  fi
   (
     cd "$REPO_DIR"
-    nohup env HUB_BIND=0.0.0.0 HUB_PORT=$HUB_PORT HUB_AUTH_TOKEN="$HUB_AUTH_TOKEN" GROQ_API_KEY="$GROQ_API_KEY_RESOLVED" HUB_ALLOWED_ORIGINS="$ALLOWED_ORIGINS" \
+    nohup env HUB_BIND_MODE="${HUB_BIND_MODE:-tailnet}" HUB_TAILSCALE_IP="$ts_ip" HUB_PORT=$HUB_PORT HUB_AUTH_TOKEN="$HUB_AUTH_TOKEN" GROQ_API_KEY="$GROQ_API_KEY_RESOLVED" HUB_ALLOWED_ORIGINS="$ALLOWED_ORIGINS" \
       HUB_REPLY_RELAY_CMD='bash server/notification-hub/reply-relay.sh' \
       RELAY_ENABLE_TMUX=1 \
       RELAY_TMUX_AUTO_DETECT=1 \
