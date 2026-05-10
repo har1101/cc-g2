@@ -57,6 +57,17 @@ export type SttSession = {
   onPartial?(handler: (p: SttPartialResult) => void): void
   /** engine 内で発生したエラーの subscribe */
   onError?(handler: (err: { code: string; message: string }) => void): void
+  /**
+   * Phase 2: streaming engine specific.
+   *
+   * Called when a `stt.final` arrives AFTER `finalize()` already resolved
+   * (e.g. 800ms timeout fired and the synthesized final was returned, but
+   * the real provider final landed shortly after). Caller can use this to
+   * patch the confirm screen if the user has not yet pressed Send.
+   *
+   * Batch engines do not call this.
+   */
+  onLateFinal?(handler: (r: SttFinalResult) => void): void
 }
 
 export type SttEngineStartOpts = {

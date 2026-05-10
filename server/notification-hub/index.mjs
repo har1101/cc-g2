@@ -42,6 +42,8 @@ import * as locationRoute from './routes/location.mjs'
 import * as contextStatusRoute from './routes/context-status.mjs'
 import * as commandRoute from './routes/command.mjs'
 import * as uiRoute from './routes/ui.mjs'
+import { attachSttStreamWss } from './routes/stt-stream.mjs'
+import { createDeepgramEngine } from './stt/deepgram-engine.mjs'
 
 const { notificationsFile, repliesFile, clientEventsFile, approvalsFile } = buildPaths({
   dataDir: config.dataDir,
@@ -205,6 +207,18 @@ const servers = bindHosts.map((bindHost) => {
   })
   s.listen(config.port, bindHost, () => {
     log(`notification-hub listening on http://${bindHost}:${config.port}`)
+  })
+  // Phase 2: WSS endpoint for live STT. Engine is created per-session so that
+  // each upgrade gets its own Deepgram socket — keeps the existing HTTP STT
+  // path (groq-batch via /api/stt/transcriptions) untouched.
+  attachSttStreamWss(s, {
+    hubAuthToken: config.hubAuthToken,
+    createSttEngine: () =>
+      createDeepgramEngine({
+        apiKey: config.deepgramApiKey,
+        model: config.deepgramModel,
+        language: config.deepgramLanguage,
+      }),
   })
   return s
 })

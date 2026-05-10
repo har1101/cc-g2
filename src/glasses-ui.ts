@@ -46,6 +46,7 @@ export type NotificationUIState = {
     | 'reply-confirm'
     | 'reply-sending'
     | 'voice-command-recording'
+    | 'voice-command-recording-streaming'
     | 'voice-command-confirm'
     | 'voice-command-sending'
     | 'voice-command-done'
@@ -188,6 +189,22 @@ function byteLen(text: string): number {
   return textEncoder.encode(text).length
 }
 
+/**
+ * Phase 2 (voice-command-recording-streaming): keep only the trailing
+ * `maxChars` codepoints of `text`. If the string is shorter, return as-is.
+ *
+ * We use codepoint count (Array.from) instead of byte count because the
+ * streaming UI is character-budget bound (~150 visible chars), and
+ * code-point trimming is sufficient — paginateText handles the harder
+ * UTF-8 byte cap that the firmware enforces.
+ */
+function windowTrailing(text: string, maxChars: number): string {
+  if (!text) return ''
+  const chars = Array.from(text)
+  if (chars.length <= maxChars) return text
+  return chars.slice(-maxChars).join('')
+}
+
 function formatListItemName(item: NotificationItem): string {
   const age = formatAge(item.createdAt)
   const s = item.replyStatus
@@ -251,7 +268,7 @@ function formatCurrentDateTime(now = new Date()): string {
 export function createGlassesUI() {
   // The host treats startup-page creation as one-time init; later UI changes should use rebuild.
   const startupRenderedBridges = new WeakSet<object>()
-  const layoutByBridge = new WeakMap<object, 'base' | 'text' | 'idle-launcher' | 'approval' | 'notif-list' | 'notif-detail' | 'notif-actions' | 'ask-question' | 'reply-recording' | 'reply-confirm' | 'reply-result' | 'vc-recording' | 'vc-confirm' | 'vc-sending' | 'vc-done'>()
+  const layoutByBridge = new WeakMap<object, 'base' | 'text' | 'idle-launcher' | 'approval' | 'notif-list' | 'notif-detail' | 'notif-actions' | 'ask-question' | 'reply-recording' | 'reply-confirm' | 'reply-result' | 'vc-recording' | 'vc-rec-stream' | 'vc-confirm' | 'vc-sending' | 'vc-done'>()
   const bridgeKeyOf = (conn: BridgeConnection) => conn.bridge as unknown as object
 
   // 描画ロック: SDK呼び出しの同時実行を防ぐ（実機で衝突するとG2が固まる）
@@ -956,6 +973,96 @@ export function createGlassesUI() {
       })
       layoutByBridge.set(bridgeKeyOf(conn), 'vc-recording')
       log(`G2 voice-command 録音中表示: ${seconds}s`)
+    },
+
+    /**
+     * 音声コマンド録音中画面（live transcript対応, Phase 2）
+     *
+     * Deepgram streaming で受け取った partial を G2 に流す。 stable + partial を
+     * 末尾 ~150 文字で windowing し、 partial 末尾には未確定マークを付ける。
+     * 同じレイアウトに居る間は textContainerUpgrade で本文だけ書き換える
+     * (rebuild は重いため partial 5-10Hz には間に合わない)。
+     */
+    async showVoiceCommandRecordingStreaming(
+      conn: BridgeConnection,
+      opts: { stableText: string; partialText: string; elapsedMs: number },
+    ): Promise<void> {
+      if (!conn.bridge) {
+        log(`[Mock] G2 voice-command (stream): "${opts.stableText}|${opts.partialText}"`)
+        return
+      }
+
+      const seconds = Math.max(0, Math.floor((opts.elapsedMs ?? 0) / 1000))
+      const mm = String(Math.floor(seconds / 60)).padStart(2, '0')
+      const ss = String(seconds % 60).padStart(2, '0')
+      const headerText = `Listening ● ${mm}:${ss}`
+
+      // window the displayed text to the trailing ~150 chars
+      const stable = (opts.stableText || '').replace(/\s+$/, '')
+      const partialRaw = (opts.partialText || '').replace(/\s+$/, '')
+      const partial = partialRaw ? `${partialRaw}…` : ''
+      const combined = stable + (partial ? (stable ? '\n' : '') + partial : '')
+      const windowed = windowTrailing(combined, 150)
+      const bodyText = windowed
+        ? `${windowed}\n\nTap: Send / DblTap: Cancel`
+        : `（聴き取り中…）\n\nTap: Send / DblTap: Cancel`
+
+      const bridgeKey = bridgeKeyOf(conn)
+      // Same layout → textContainerUpgrade only (5-10Hz throttling lives in caller).
+      if (
+        startupRenderedBridges.has(bridgeKey) &&
+        layoutByBridge.get(bridgeKey) === 'vc-rec-stream' &&
+        conn.bridge.textContainerUpgrade
+      ) {
+        const h = await conn.bridge.textContainerUpgrade(
+          new TextContainerUpgrade({
+            containerID: 1,
+            containerName: 'vc-stream-hdr',
+            contentOffset: 0,
+            contentLength: headerText.length,
+            content: headerText,
+          }),
+        )
+        const b = await conn.bridge.textContainerUpgrade(
+          new TextContainerUpgrade({
+            containerID: 2,
+            containerName: 'vc-stream-body',
+            contentOffset: 0,
+            contentLength: bodyText.length,
+            content: bodyText,
+          }),
+        )
+        if (h && b) return
+        log('G2 textContainerUpgrade に失敗 → ページ再描画へフォールバック')
+      }
+
+      const headerContainer = new TextContainerProperty({
+        xPosition: 8,
+        yPosition: 4,
+        width: 560,
+        height: 28,
+        containerID: 1,
+        containerName: 'vc-stream-hdr',
+        content: headerText,
+        isEventCapture: 0,
+      })
+
+      const bodyContainer = new TextContainerProperty({
+        xPosition: 8,
+        yPosition: 36,
+        width: 560,
+        height: 240,
+        containerID: 2,
+        containerName: 'vc-stream-body',
+        content: bodyText,
+        isEventCapture: 1,
+      })
+
+      await renderStartupPage(conn, {
+        texts: [headerContainer, bodyContainer],
+        targetLayout: 'vc-rec-stream',
+      })
+      layoutByBridge.set(bridgeKeyOf(conn), 'vc-rec-stream')
     },
 
     /**

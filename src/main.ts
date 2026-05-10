@@ -9,6 +9,8 @@ import { createAudioSession, type AudioSession } from './audio-session'
 import { createRenderQueue, type RenderQueue } from './render-queue'
 import { createEventDispatcher, type EventDispatcher } from './event-dispatcher'
 import { createGroqBatchEngine } from './stt/groq-batch'
+import { createDeepgramStreamEngine } from './stt/deepgram-stream'
+import type { SttEngine } from './stt/engine'
 import {
   installScreenHelpers,
   isAnyRendering,
@@ -26,6 +28,8 @@ import {
   sendVoiceCommandAndShowResult,
   returnToIdleFromVoiceCommand,
   scheduleVoiceCommandDoneReturn,
+  finalizeVoiceCommandStreaming,
+  cancelVoiceCommandStreaming,
 } from './screens/_helpers'
 import type { ScreenContext } from './screens/types'
 import { createNotifEventDispatcher } from './screens/dispatch'
@@ -134,7 +138,14 @@ let audioSession: AudioSession | null = null
 
 const glassesUI = createGlassesUI()
 const notifClient = createNotificationClient(appConfig.notificationHubUrl)
-const sttEngine = createGroqBatchEngine()
+// Phase 2: two STT engines wired in parallel.
+// - voice-command path: configurable (groq-batch / deepgram-stream)
+// - permission コメント (返信) path: always groq-batch (短文)
+const sttEngineForReply: SttEngine = createGroqBatchEngine()
+const sttEngine: SttEngine = appConfig.sttEngineVoiceCommand === 'deepgram-stream'
+  ? createDeepgramStreamEngine()
+  : createGroqBatchEngine()
+log(`STT engine for voice-command: ${sttEngine.kind}`)
 
 const renderQueue: RenderQueue = createRenderQueue({
   log: (msg) => log(msg),
@@ -173,6 +184,7 @@ installScreenHelpers({
   notifClient,
   renderQueue,
   sttEngine,
+  sttEngineForReply,
   log,
   appConfig: { notificationIdleDimMode: appConfig.notificationIdleDimMode },
   updateNotifInfo: () => notifController.updateNotifInfo(),
@@ -195,6 +207,7 @@ function buildScreenContext(): ScreenContext {
     audioSession,
     renderQueue,
     sttEngine,
+    sttEngineForReply,
     log,
     updateNotifInfo: () => notifController.updateNotifInfo(),
     returnToListFromResult,
@@ -209,6 +222,8 @@ function buildScreenContext(): ScreenContext {
     sendVoiceCommandAndShowResult,
     returnToIdleFromVoiceCommand,
     scheduleVoiceCommandDoneReturn,
+    finalizeVoiceCommandStreaming,
+    cancelVoiceCommandStreaming,
     startReplyAudioRecording,
     stopReplyAudioRecording,
     isAskUserQuestionNotification,

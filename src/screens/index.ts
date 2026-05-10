@@ -19,6 +19,7 @@ import * as replyRecordingScreen from './reply-recording'
 import * as replyConfirmScreen from './reply-confirm'
 import * as replySendingScreen from './reply-sending'
 import * as vcRecordingScreen from './voice-command-recording'
+import * as vcRecordingStreamingScreen from './voice-command-recording-streaming'
 import * as vcConfirmScreen from './voice-command-confirm'
 import * as vcSendingScreen from './voice-command-sending'
 import * as vcDoneScreen from './voice-command-done'
@@ -35,6 +36,7 @@ const SCREEN_HANDLERS: Record<Screen, Handler> = {
   'reply-confirm': replyConfirmScreen.handle,
   'reply-sending': replySendingScreen.handle,
   'voice-command-recording': vcRecordingScreen.handle,
+  'voice-command-recording-streaming': vcRecordingStreamingScreen.handle,
   'voice-command-confirm': vcConfirmScreen.handle,
   'voice-command-sending': vcSendingScreen.handle,
   'voice-command-done': vcDoneScreen.handle,
