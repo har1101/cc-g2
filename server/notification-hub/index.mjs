@@ -42,6 +42,7 @@ import * as locationRoute from './routes/location.mjs'
 import * as contextStatusRoute from './routes/context-status.mjs'
 import * as commandRoute from './routes/command.mjs'
 import * as sessionsRoute from './routes/sessions.mjs'
+import * as permissionsRoute from './routes/permissions.mjs'
 import * as uiRoute from './routes/ui.mjs'
 import { attachSttStreamWss } from './routes/stt-stream.mjs'
 import { createDeepgramEngine } from './stt/deepgram-engine.mjs'
@@ -142,6 +143,7 @@ const routeHandlers = [
   approvalsRoute.handle,
   notificationsRoute.handle,
   sessionsRoute.handle,
+  permissionsRoute.handle,
   uiRoute.handle,
 ]
 
