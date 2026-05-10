@@ -145,6 +145,53 @@ export async function persistReply(record, cfg) {
 }
 
 /**
+ * Phase 5 §5.3: server-side guard for destructive 2-step. Inspects the linked
+ * notification's `metadata.risk_tier`. If destructive AND the caller says
+ * approve without `two_step_confirmed=true`, returns a deny rewrite plus the
+ * audit fields needed by both /api/notifications/:id/reply (processReply) and
+ * /api/approvals/:id/decide (routes/approvals).
+ *
+ * Returns:
+ *   - `{ ok: true }`                                   — no rewrite needed
+ *   - `{ ok: false, forcedAction: 'deny', reason, ... }` — caller must rewrite
+ *
+ * The audit-log emission is the caller's responsibility — this helper only
+ * shapes the verdict so both call sites format their `permission.forced_deny`
+ * entry consistently.
+ *
+ * @param {{
+ *   notification: import('../state/store.mjs').NotificationItem | null | undefined,
+ *   action: string,
+ *   twoStepConfirmed: boolean,
+ * }} params
+ * @returns {{ ok: true } | {
+ *   ok: false,
+ *   forcedAction: 'deny',
+ *   reason: 'forced_deny:no_two_step',
+ *   riskTier: 'destructive',
+ *   requestId?: string,
+ *   agentSessionId?: string,
+ *   toolName?: string,
+ * }}
+ */
+export function applyDestructiveGuard({ notification, action, twoStepConfirmed }) {
+  if (action !== 'approve' || twoStepConfirmed) return { ok: true }
+  const meta = notification && notification.metadata
+  if (!meta) return { ok: true }
+  const riskTier = typeof meta.risk_tier === 'string' ? meta.risk_tier : null
+  if (riskTier !== 'destructive') return { ok: true }
+  return {
+    ok: false,
+    forcedAction: 'deny',
+    reason: 'forced_deny:no_two_step',
+    riskTier: 'destructive',
+    requestId: typeof meta.request_id === 'string' ? meta.request_id : undefined,
+    agentSessionId: typeof meta.agentSessionId === 'string' ? meta.agentSessionId : undefined,
+    toolName: typeof meta.toolName === 'string' ? meta.toolName : undefined,
+  }
+}
+
+/**
  * End-to-end reply processing for POST /api/notifications/:id/reply.
  * Owns: validation of action/answerData, approval matching + resolution,
  * forward + relay invocation, status reduction, persistence, and logging.
@@ -189,41 +236,34 @@ export async function processReply(input, cfg) {
     ? body.latency_ms
     : undefined
 
-  // Phase 5 §5.3: server-side guard for destructive 2-step. If the linked
-  // notification is risk_tier=='destructive' and the client says approve
-  // without two_step_confirmed, force-rewrite to deny + audit-log
-  // forced_deny:no_two_step. The rewrite happens before any action dispatch
-  // so all downstream branches (resolveApproval / relay / persist) see deny.
+  // Phase 5 §5.3: server-side guard for destructive 2-step. The rewrite
+  // happens before any action dispatch so all downstream branches
+  // (resolveApproval / relay / persist) see deny. Logic is shared with
+  // /api/approvals/:id/decide via applyDestructiveGuard().
   let forcedDenyApplied = false
-  if (action === 'approve' && !twoStepConfirmed) {
-    const riskTier = item.metadata && typeof item.metadata.risk_tier === 'string'
-      ? item.metadata.risk_tier
-      : null
-    if (riskTier === 'destructive') {
-      const requestId = item.metadata && typeof item.metadata.request_id === 'string'
-        ? item.metadata.request_id
-        : undefined
-      const agentSessionId = item.metadata && typeof item.metadata.agentSessionId === 'string'
-        ? item.metadata.agentSessionId
-        : undefined
-      log(`approval-broker forced_deny:no_two_step notificationId=${notificationId} action=${action}→deny`)
-      writeAuditEntry({
-        event: 'permission.forced_deny',
-        request_id: requestId,
-        agent_session_id: agentSessionId,
-        tool_name: item.metadata && item.metadata.toolName,
-        reason: 'forced_deny:no_two_step',
-        device_id: deviceId,
-        source,
-      })
-      action = 'deny'
-      // Preserve the original intent in the comment so the agent / human
-      // reviewing the audit log can see "the user tried to approve without
-      // the 2-step confirm".
-      const note = '[forced_deny:no_two_step] approve attempt without two_step_confirmed'
-      comment = comment ? `${comment} ${note}` : note
-      forcedDenyApplied = true
-    }
+  const guard = applyDestructiveGuard({
+    notification: item,
+    action,
+    twoStepConfirmed,
+  })
+  if (!guard.ok) {
+    log(`approval-broker forced_deny:no_two_step notificationId=${notificationId} action=${action}→deny`)
+    writeAuditEntry({
+      event: 'permission.forced_deny',
+      request_id: guard.requestId,
+      agent_session_id: guard.agentSessionId,
+      tool_name: guard.toolName,
+      reason: guard.reason,
+      device_id: deviceId,
+      source,
+    })
+    action = guard.forcedAction
+    // Preserve the original intent in the comment so the agent / human
+    // reviewing the audit log can see "the user tried to approve without
+    // the 2-step confirm".
+    const note = '[forced_deny:no_two_step] approve attempt without two_step_confirmed'
+    comment = comment ? `${comment} ${note}` : note
+    forcedDenyApplied = true
   }
 
   // answerData バリデーション: plain object, キー/値とも string, 上限付き

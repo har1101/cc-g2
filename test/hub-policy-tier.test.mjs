@@ -145,10 +145,12 @@ describe('Notification Hub — Phase 5 policy classifier integration', () => {
     expect(notif.metadata.risk_tier).toBe('destructive')
     expect(typeof notif.metadata.timeout_at).toBe('string')
 
-    // Approve to unblock the long-poll.
+    // Approve to unblock the long-poll. Destructive risk_tier requires
+    // two_step_confirmed=true even on the /decide route (Codex blocking).
     await postJson(hubBase, `/api/approvals/${pending.id}/decide`, {
       decision: 'approve',
       source: 'g2',
+      two_step_confirmed: true,
     })
     const result = await hookPromise
     expect(result.data.hookSpecificOutput.decision.behavior).toBe('allow')

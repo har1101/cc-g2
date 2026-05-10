@@ -1,7 +1,10 @@
 // /api/approvals (POST/GET), /api/approvals/:id (GET), /api/approvals/:id/decide (POST)
 import { getString, readRequestBody, safeJsonParse } from '../notification-utils.mjs'
 import { isBodyTooLargeError, sendJson, sendRequestBodyTooLarge } from '../core/http.mjs'
+import { log } from '../core/log.mjs'
+import { writeAuditEntry } from '../core/audit-log.mjs'
 import { getApproval, listPendingApprovals } from '../services/approval-service.mjs'
+import { applyDestructiveGuard, getNotification } from '../services/notification-service.mjs'
 
 function matchApprovalPath(pathname) {
   const m = pathname.match(/^\/api\/approvals\/([^/]+)$/)
@@ -109,9 +112,36 @@ export async function handle(req, res, ctx) {
         sendJson(res, 400, { ok: false, error: '`decision` must be "approve" or "deny"' })
         return true
       }
-      const comment = getString(parsed.value.comment)
+      let comment = getString(parsed.value.comment)
       const source = getString(parsed.value.source)
-      const updated = deps.resolveApproval(approvalId, decision, comment, source)
+      const twoStepConfirmed = parsed.value.two_step_confirmed === true
+
+      // Phase 5 Codex pass: the web UI / external clients can hit this route
+      // directly. Apply the same destructive 2-step guard processReply() uses,
+      // so destructive risk_tier approvals always require two_step_confirmed.
+      let effectiveDecision = decision
+      const linkedNotification = getNotification(record.notificationId)
+      const guard = applyDestructiveGuard({
+        notification: linkedNotification,
+        action: decision,
+        twoStepConfirmed,
+      })
+      if (!guard.ok) {
+        log(`approval-broker forced_deny:no_two_step approvalId=${approvalId} decision=${decision}→deny (route=/api/approvals/:id/decide)`)
+        writeAuditEntry({
+          event: 'permission.forced_deny',
+          request_id: guard.requestId,
+          agent_session_id: guard.agentSessionId,
+          tool_name: guard.toolName,
+          reason: guard.reason,
+          source: source || undefined,
+        })
+        effectiveDecision = guard.forcedAction
+        const note = '[forced_deny:no_two_step] approve attempt without two_step_confirmed'
+        comment = comment ? `${comment} ${note}` : note
+      }
+
+      const updated = deps.resolveApproval(approvalId, effectiveDecision, comment, source)
       sendJson(res, 200, { ok: true, approval: updated })
       return true
     }
