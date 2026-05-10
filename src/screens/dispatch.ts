@@ -16,6 +16,30 @@ import type { ScreenContext } from './types'
 import { dispatchScreen } from './index'
 import { normalizeHubEvent } from '../even-events'
 import { store } from '../state/store'
+import { startVoiceCommandRecording } from './_helpers'
+
+/**
+ * Screens that the triple-tap chord MUST NOT interrupt:
+ *   - voice-command-* / reply-* — already holds the mic, would race
+ *   - permission-destructive-confirm — safety-critical 2-step gate
+ *   - action-blocked — already deny-decided, cosmetic ack only
+ *   - session-list-create-confirm — short-lived modal
+ * On these screens the chord is a no-op and the user's tap goes to the
+ * regular per-screen handler.
+ */
+const CHORD_BLOCKED_SCREENS = new Set([
+  'voice-command-recording',
+  'voice-command-recording-streaming',
+  'voice-command-confirm',
+  'voice-command-sending',
+  'voice-command-done',
+  'reply-recording',
+  'reply-confirm',
+  'reply-sending',
+  'permission-destructive-confirm',
+  'action-blocked',
+  'session-list-create-confirm',
+])
 
 export type DispatchDeps = {
   log: (msg: string) => void
@@ -68,6 +92,35 @@ export function createNotifEventDispatcher(deps: DispatchDeps): (event: EvenHubE
       const eventType = normalized.eventType
       if (normalized.kind === 'tap' || normalized.kind === 'doubleTap') {
         store.eventQueue.lastTapEventAt = Date.now()
+      }
+
+      // Triple-tap chord (DOUBLE_CLICK followed within `chord.windowMs` by a
+      // CLICK = 3 physical taps in quick succession) → global voice-command
+      // shortcut. Bypass the per-screen handler.
+      if (normalized.kind === 'doubleTap') {
+        store.chord.lastDoubleTapAt = Date.now()
+      } else if (normalized.kind === 'tap' && store.chord.lastDoubleTapAt > 0) {
+        const sinceDoubleTap = Date.now() - store.chord.lastDoubleTapAt
+        if (sinceDoubleTap < store.chord.windowMs) {
+          store.chord.lastDoubleTapAt = 0 // consume
+          if (CHORD_BLOCKED_SCREENS.has(store.notif.screen)) {
+            log(`[chord] triple-tap ignored on screen=${store.notif.screen}`)
+          } else {
+            log(`[chord] triple-tap → voice-command shortcut (from screen=${store.notif.screen})`)
+            void startVoiceCommandRecording()
+            return
+          }
+        } else {
+          // Stale arm; clear so a future quick double-tap isn't poisoned by it.
+          store.chord.lastDoubleTapAt = 0
+        }
+      } else if (
+        normalized.kind === 'scrollTop' ||
+        normalized.kind === 'scrollBottom'
+      ) {
+        // Any non-tap event clears chord arming so DOUBLE_CLICK + scroll +
+        // CLICK doesn't fire the chord.
+        store.chord.lastDoubleTapAt = 0
       }
 
       // idle screen の "render-busy 中の保留フラグ" は idle handler 自身に責任があるが、
