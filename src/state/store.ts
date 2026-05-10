@@ -155,21 +155,6 @@ export type SessionUiState = {
   pendingCountsByOtherSession: Record<string, number>
 }
 
-/**
- * Triple-tap chord state for the "voice command from anywhere" shortcut.
- *
- * Even Hub SDK does not expose a long-press event (only CLICK / DOUBLE_CLICK
- * / SCROLL_TOP / SCROLL_BOTTOM), so we synthesize a global voice-command
- * gesture from "double-tap then quick single-tap" (= 3 physical taps in a
- * row). lastDoubleTapAt records the instant a DOUBLE_CLICK was observed;
- * when a CLICK arrives within `windowMs`, the dispatcher diverts it to
- * startVoiceCommandRecording instead of the per-screen handler.
- */
-export type ChordState = {
-  lastDoubleTapAt: number
-  windowMs: number
-}
-
 export type Store = {
   notif: NotificationUIState
   reply: ReplyState
@@ -181,7 +166,6 @@ export type Store = {
   context: ContextState
   sessionList: SessionListState
   sessionUi: SessionUiState
-  chord: ChordState
 }
 
 /** 既定値で store を生成。 main.ts は import 時にこのインスタンスをそのまま使う。 */
@@ -290,12 +274,7 @@ function createStore(): Store {
     pendingCountsByOtherSession: {},
   }
 
-  const chord: ChordState = {
-    lastDoubleTapAt: 0,
-    windowMs: 400,
-  }
-
-  return { notif, reply, voice, dev, dashboard, idle, eventQueue, context, sessionList, sessionUi, chord }
+  return { notif, reply, voice, dev, dashboard, idle, eventQueue, context, sessionList, sessionUi }
 }
 
 export const store: Store = createStore()
