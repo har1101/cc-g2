@@ -103,9 +103,29 @@ export function createNotificationClient(baseUrl: string) {
   }
 
   return {
-    async list(limit = 20): Promise<NotificationItem[]> {
+    /**
+     * List recent notifications. Phase 4: accepts an optional
+     * `{ sessionId, limit }` object. Pre-Phase-4 callers passing a bare
+     * `number` for limit keep working — we detect and translate.
+     *
+     * - When `sessionId` is omitted → returns all notifications (existing
+     *   behaviour, unchanged for backwards compatibility).
+     * - When `sessionId` is set → server filters via
+     *   listNotificationsForSession() so the response only contains items
+     *   bound to that AgentSession.
+     */
+    async list(opts?: number | { sessionId?: string; limit?: number }): Promise<NotificationItem[]> {
+      const limit = typeof opts === 'number'
+        ? opts
+        : typeof opts?.limit === 'number'
+          ? opts.limit
+          : 20
+      const sessionId = typeof opts === 'object' && opts ? opts.sessionId : undefined
+      const params = new URLSearchParams()
+      params.set('limit', String(limit))
+      if (sessionId) params.set('session_id', sessionId)
       const res = await fetchJson<NotificationListResponse>(
-        `/api/notifications?limit=${limit}`,
+        `/api/notifications?${params.toString()}`,
         { headers: createHubHeaders() },
       )
       return res.items
